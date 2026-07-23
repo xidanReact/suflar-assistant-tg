@@ -54,3 +54,8 @@ def test_suggest_raises_when_reply_has_no_numbered_lines():
     s = _make_suggester_with_reply("просто текст без нумерации")
     with pytest.raises(SuggesterError):
         s.suggest([{"from_me": False, "text": "хай"}])
+
+
+def test_suggest_returns_partial_when_model_gives_fewer_than_three():
+    s = _make_suggester_with_reply("1) Только один\n2) И второй")
+    assert s.suggest([{"from_me": False, "text": "хай"}]) == ["Только один", "И второй"]
