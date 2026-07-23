@@ -10,9 +10,11 @@
 2. Получи `api_id` и `api_hash` на https://my.telegram.org → API development tools.
 3. Получи ключ DeepSeek на https://platform.deepseek.com.
 4. Скопируй `.env.example` в `.env` и заполни `TG_API_ID`, `TG_API_HASH`, `DEEPSEEK_API_KEY`.
-5. Скопируй `config.example.yaml` в `config.yaml`. Создай в Telegram приватную
-   группу «только я» и укажи её username (или имя контакта) в `panel_chat`.
-   Можно указать `me` — тогда подсказки будут приходить в «Избранное».
+5. Скопируй `config.example.yaml` в `config.yaml`. Проще всего оставить
+   `panel_chat: me` — подсказки будут приходить в твоё «Избранное» (Saved
+   Messages). Если хочешь отдельный чат-пульт — создай приватную группу и
+   укажи её **числовой** chat id (у приватных групп нет username, поэтому
+   имя не подойдёт).
 
 ## Запуск
 
@@ -25,3 +27,4 @@
 
 - `/on` / `/off` в чате-пульте — включить/выключить подсказки.
 - Игнор-лист (мама, коллеги) — в `config.yaml`.
+- Состояние `/on` / `/off` сбрасывается во «включено» при перезапуске бота.
