@@ -23,14 +23,21 @@ STATE = {"enabled": True}
 
 
 async def _collect_history(client, chat_id, limit):
+    """История диалога и признак того, что она целиком, а не обрезана лимитом.
+
+    Упёрлись в лимит — начала переписки не видно, и говорить, кто написал
+    первым, нельзя: первым в выборке окажется случайный человек.
+    """
     history = []
+    seen = 0
     async for msg in client.iter_messages(chat_id, limit=limit):
+        seen += 1
         if not msg.text:
             continue
         history.append({"from_me": bool(msg.out), "text": msg.text,
                         "date": msg.date})
     history.reverse()  # от старых к новым
-    return history
+    return history, seen < limit
 
 
 def _ask_password(prompt_fn=getpass.getpass) -> str:
@@ -135,7 +142,7 @@ async def _handle_hint(client, cfg, suggester, event, arg: str):
         return
 
     name = utils.get_display_name(entity) or str(target)
-    history = await _collect_history(client, entity, cfg.context_messages)
+    history, full = await _collect_history(client, entity, cfg.context_messages)
     if not history:
         await client.send_message(
             cfg.panel_chat, f"В диалоге с {name} нет текстовых сообщений.",
@@ -144,7 +151,7 @@ async def _handle_hint(client, cfg, suggester, event, arg: str):
 
     try:
         analysis, variants = await asyncio.to_thread(suggester.analyze,
-                                                     history, name)
+                                                     history, name, full)
     except SuggesterError:
         await client.send_message(cfg.panel_chat, format_error(name),
                                   parse_mode=None)
@@ -208,10 +215,12 @@ async def _amain():
         except errors.RPCError:
             pass
 
-        history = await _collect_history(client, event.chat_id, cfg.context_messages)
+        history, full = await _collect_history(client, event.chat_id,
+                                               cfg.context_messages)
         try:
             analysis, variants = await asyncio.to_thread(suggester.analyze,
-                                                         history, sender_name)
+                                                         history, sender_name,
+                                                         full)
         except SuggesterError:
             await client.send_message(cfg.panel_chat, format_error(sender_name),
                                       parse_mode=None)

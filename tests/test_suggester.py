@@ -4,7 +4,8 @@ from datetime import datetime, timedelta, timezone
 
 from suflor.suggester import (
     build_messages, build_system_prompt, variants_word, humanize_delta,
-    parse_suggestions, parse_analysis, Suggester, SuggesterError,
+    initiative_summary, questions_asked, parse_suggestions, parse_analysis,
+    Suggester, SuggesterError,
 )
 
 NOW = datetime(2026, 8, 24, 12, 0, tzinfo=timezone.utc)
@@ -69,6 +70,136 @@ def test_build_messages_has_system_and_user():
     assert msgs[0] == {"role": "system", "content": "системный промпт"}
     assert msgs[-1]["role"] == "user"
     assert "привет" in msgs[-1]["content"]
+
+
+def test_initiative_names_who_started_when_history_is_whole():
+    history = [_msg("привет", 60), _msg("о, привет", 55, from_me=True)]
+    summary = initiative_summary(history, "Аня")
+    assert "начал переписку: Аня" in summary
+    assert "последним писал: я" in summary
+
+
+def test_initiative_marks_my_first_message():
+    history = [_msg("привет", 60, from_me=True), _msg("хай", 55)]
+    summary = initiative_summary(history, "Аня")
+    assert "начал переписку: я" in summary
+    assert "последним писал: Аня" in summary
+
+
+def test_initiative_counts_messages_on_both_sides():
+    history = [_msg("а", 60), _msg("б", 55, from_me=True), _msg("в", 50)]
+    assert "сообщений всего: Аня — 2, я — 1" in initiative_summary(history, "Аня")
+
+
+def test_initiative_counts_who_breaks_long_silences():
+    history = [
+        _msg("привет", 60 * 24 * 3),          # начало
+        _msg("ну как ты", 60 * 24 * 2),       # она вернулась через сутки
+        _msg("нормально", 60 * 24 * 2 - 5, from_me=True),  # мой ответ сразу
+        _msg("давно не виделись", 30, from_me=True),       # я после паузы
+    ]
+    summary = initiative_summary(history, "Аня")
+    assert "после долгой паузы: Аня — 1 раз, я — 1 раз" in summary
+
+
+def test_initiative_omits_pause_line_without_long_pauses():
+    history = [_msg("привет", 40), _msg("хай", 35, from_me=True)]
+    assert "после долгой паузы" not in initiative_summary(history, "Аня")
+
+
+def test_initiative_admits_when_start_is_cut_off_by_the_limit():
+    # Обрезанная лимитом переписка: первый в выборке ≠ начавший диалог
+    history = [_msg("привет", 60), _msg("о, привет", 55, from_me=True)]
+    summary = initiative_summary(history, "Аня", full_history=False)
+    assert "начал переписку" not in summary
+    assert "начало переписки не видно" in summary
+    assert "последним писал: я" in summary
+
+
+def test_initiative_empty_for_empty_history():
+    assert initiative_summary([], "Аня") == ""
+
+
+def test_build_messages_includes_initiative_block():
+    history = [_msg("привет", 60), _msg("о, привет", 55, from_me=True)]
+    body = build_messages(history, "промпт", now=NOW,
+                          partner_name="Аня")[-1]["content"]
+    assert "Инициатива в диалоге:" in body
+    assert "начал переписку: Аня" in body
+
+
+def test_build_messages_passes_through_truncation_flag():
+    history = [_msg("привет", 60)]
+    body = build_messages(history, "промпт", now=NOW, partner_name="Аня",
+                          full_history=False)[-1]["content"]
+    assert "начало переписки не видно" in body
+
+
+def test_questions_lists_both_sides_with_authors():
+    history = [_msg("Как дела?", 60, from_me=True),
+               _msg("Нормально. А у тебя?)", 55),
+               _msg("Чем занимаешься?", 50)]
+    block = questions_asked(history, "Аня")
+    assert "- я: Как дела?" in block
+    assert "- Аня: А у тебя?" in block
+    assert "- Аня: Чем занимаешься?" in block
+
+
+def test_questions_ignore_statements():
+    assert questions_asked([_msg("Привет, я дома!", 5)], "Аня") == ""
+
+
+def test_questions_split_several_in_one_message():
+    block = questions_asked([_msg("Привет! Как ты? Чем занят?", 5)], "Аня")
+    assert "- Аня: Как ты?" in block
+    assert "- Аня: Чем занят?" in block
+    assert "Привет" not in block
+
+
+def test_questions_collapse_repeats_keeping_the_latest():
+    history = [_msg("Как дела?", 60, from_me=True),
+               _msg("нормально", 55),
+               _msg("как дела?)", 50, from_me=True)]
+    block = questions_asked(history, "Аня")
+    assert block.count("ак дела") == 1
+
+
+def test_questions_keep_only_the_freshest():
+    history = [_msg(f"вопрос {i}?", 100 - i) for i in range(20)]
+    block = questions_asked(history, "Аня", limit=3)
+    assert "вопрос 19?" in block
+    assert "вопрос 0?" not in block
+
+
+def test_build_messages_includes_asked_questions():
+    history = [_msg("Чем занимаешься?", 5)]
+    body = build_messages(history, "промпт", now=NOW,
+                          partner_name="Аня")[-1]["content"]
+    assert "Вопросы, которые уже звучали" in body
+    assert "- Аня: Чем занимаешься?" in body
+
+
+def test_build_messages_skips_question_block_when_there_are_none():
+    body = build_messages([_msg("привет", 5)], "промпт", now=NOW)[-1]["content"]
+    assert "Вопросы, которые уже звучали" not in body
+    assert "Инициатива в диалоге:" in body
+
+
+def test_build_system_prompt_forbids_bouncing_the_same_question_back():
+    prompt = build_system_prompt(["дерзкий"], "стиль")
+    assert "не возвращай" in prompt.lower()
+    assert "Вопросы, которые уже звучали" not in prompt  # это блок в user-части
+
+
+def test_build_system_prompt_asks_to_analyze_initiative():
+    prompt = build_system_prompt(["дерзкий"], "стиль")
+    assert "инициативу" in prompt.lower()
+    assert "Инициатива в диалоге" in prompt
+
+
+def test_build_system_prompt_keeps_flirt_light():
+    prompt = build_system_prompt(["дерзкий"], "стиль")
+    assert "пошлый подтекст — нет" in prompt
 
 
 def test_build_system_prompt_uses_configured_tones_and_style():
