@@ -1,4 +1,6 @@
-from suflor.config import load_config, Config, DEFAULT_TONES, DEFAULT_STYLE
+from suflor.config import (
+    load_config, Config, DEFAULT_TONES, DEFAULT_STYLE, DEFAULT_MODEL,
+)
 
 
 def _write(tmp_path, body):
@@ -14,6 +16,21 @@ def test_reads_custom_tones_and_style(tmp_path):
     cfg = load_config(path)
     assert cfg.tones == ["дерзкий", "спокойный"]
     assert cfg.style == "Пиши строчными."
+
+
+def test_reads_temperature(tmp_path):
+    cfg = load_config(_write(tmp_path, "panel_chat: me\ntemperature: 0.4\n"))
+    assert cfg.temperature == 0.4
+
+
+def test_reads_model(tmp_path):
+    cfg = load_config(_write(tmp_path, "panel_chat: me\nmodel: deepseek-v4-pro\n"))
+    assert cfg.model == "deepseek-v4-pro"
+
+
+def test_model_falls_back_when_empty(tmp_path):
+    cfg = load_config(_write(tmp_path, "panel_chat: me\nmodel: ''\n"))
+    assert cfg.model == DEFAULT_MODEL
 
 
 def test_tones_and_style_fall_back_when_empty(tmp_path):
@@ -48,5 +65,7 @@ def test_load_config_applies_defaults(tmp_path):
     assert cfg.context_messages == 50
     assert cfg.tones == DEFAULT_TONES
     assert cfg.style == DEFAULT_STYLE
+    assert cfg.temperature == 0.7
+    assert cfg.model == DEFAULT_MODEL
     assert cfg.ignore_usernames == []
     assert cfg.ignore_user_ids == []
