@@ -22,6 +22,6 @@ def test_load_config_applies_defaults(tmp_path):
     cfg_file = tmp_path / "config.yaml"
     cfg_file.write_text("panel_chat: suflor_panel\n", encoding="utf-8")
     cfg = load_config(str(cfg_file))
-    assert cfg.context_messages == 10
+    assert cfg.context_messages == 50
     assert cfg.ignore_usernames == []
     assert cfg.ignore_user_ids == []

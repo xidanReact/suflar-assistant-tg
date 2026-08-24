@@ -1,6 +1,8 @@
 from unittest.mock import MagicMock
 import pytest
-from suflor.suggester import build_messages, parse_suggestions, Suggester, SuggesterError
+from suflor.suggester import (
+    build_messages, parse_suggestions, parse_analysis, Suggester, SuggesterError,
+)
 
 
 def test_build_messages_has_system_and_user():
@@ -35,27 +37,39 @@ def _make_suggester_with_reply(text):
     return s
 
 
-def test_suggest_returns_three_variants():
-    s = _make_suggester_with_reply("1) А\n2) Б\n3) В")
-    assert s.suggest([{"from_me": False, "text": "хай"}]) == ["А", "Б", "В"]
-
-
-def test_suggest_raises_on_api_error():
+def test_analyze_raises_on_api_error():
     s = Suggester.__new__(Suggester)
     s._model = "deepseek-chat"
     client = MagicMock()
     client.chat.completions.create.side_effect = RuntimeError("boom")
     s._client = client
     with pytest.raises(SuggesterError):
-        s.suggest([{"from_me": False, "text": "хай"}])
+        s.analyze([{"from_me": False, "text": "хай"}])
 
 
-def test_suggest_raises_when_reply_has_no_numbered_lines():
-    s = _make_suggester_with_reply("просто текст без нумерации")
+def test_analyze_returns_partial_when_model_gives_fewer_than_three():
+    s = _make_suggester_with_reply("Разбор.\n1) Только один\n2) И второй")
+    _, variants = s.analyze([{"from_me": False, "text": "хай"}])
+    assert variants == ["Только один", "И второй"]
+
+
+def test_parse_analysis_takes_text_before_first_variant():
+    raw = "Отвечает коротко.\nИнициативу не берёт.\n\n1) А\n2) Б\n3) В"
+    assert parse_analysis(raw) == "Отвечает коротко. Инициативу не берёт."
+
+
+def test_parse_analysis_empty_when_model_skips_it():
+    assert parse_analysis("1) А\n2) Б\n3) В") == ""
+
+
+def test_analyze_returns_analysis_and_variants():
+    s = _make_suggester_with_reply("Диалог заглох.\n\n1) А\n2) Б\n3) В")
+    analysis, variants = s.analyze([{"from_me": True, "text": "хай"}])
+    assert analysis == "Диалог заглох."
+    assert variants == ["А", "Б", "В"]
+
+
+def test_analyze_raises_when_reply_has_no_variants():
+    s = _make_suggester_with_reply("только разбор, вариантов нет")
     with pytest.raises(SuggesterError):
-        s.suggest([{"from_me": False, "text": "хай"}])
-
-
-def test_suggest_returns_partial_when_model_gives_fewer_than_three():
-    s = _make_suggester_with_reply("1) Только один\n2) И второй")
-    assert s.suggest([{"from_me": False, "text": "хай"}]) == ["Только один", "И второй"]
+        s.analyze([{"from_me": True, "text": "хай"}])
