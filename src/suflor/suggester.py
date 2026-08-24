@@ -146,12 +146,19 @@ def questions_asked(history: list[dict], partner: str = "Собеседник",
     return "\n".join(lines)
 
 
-def build_system_prompt(tones: list[str], style: str) -> str:
+def build_system_prompt(tones: list[str], style: str,
+                        style_block: str = "") -> str:
     """Системный промпт из настроек: тона и манера письма задаются в конфиге,
     структура ответа (разбор + нумерованные варианты) — нет, её парсим.
+
+    style_block — выученная манера из profile.py. Идёт после стиля из конфига
+    и объявлен важнее него, но структуру ответа и потолок флирта не отменяет:
+    они стоят до него и сформулированы как запреты.
     """
     n = len(tones)
     numbered = ", ".join(f"{i + 1}) {t}" for i, t in enumerate(tones))
+    # Пустой профиль обязан давать ровно тот же промпт, что и раньше
+    learned = f"\n\n{style_block}\n\n" if style_block else " "
     return (
         "Ты помогаешь мне вести переписку на сайте знакомств. "
         "Сначала дай краткий разбор диалога: 2-3 строки о том, как идёт "
@@ -204,7 +211,7 @@ def build_system_prompt(tones: list[str], style: str) -> str:
         "ответить в тон, но не подхватывать и не усиливать. "
         "Каждый вариант — одна-две короткие фразы, как реально пишут в "
         "мессенджере, а не абзац. "
-        f"{style} "
+        f"{style}{learned}"
         "Каждый вариант — на отдельной строке в формате '1) текст', "
         "'2) текст', без лишних пояснений."
     )
@@ -276,6 +283,9 @@ class Suggester:
                  model: str = "deepseek-v4-pro"):
         self._client = OpenAI(api_key=api_key, base_url="https://api.deepseek.com")
         self._model = model
+        self._tones = tones
+        self._style = style
+        # Промпт без профиля постоянен, поэтому собирается один раз
         self._system_prompt = build_system_prompt(tones, style)
         self._temperature = temperature
         # DeepSeek V4 — рассуждающие модели: внутренние рассуждения списываются
@@ -308,13 +318,19 @@ class Suggester:
 
     def analyze(self, history: list[dict],
                 partner_name: str | None = None,
-                full_history: bool = True) -> tuple[str, list[str]]:
+                full_history: bool = True,
+                style_block: str = "") -> tuple[str, list[str]]:
         """Разбор диалога плюс варианты следующего сообщения.
 
         full_history=False — переписка обрезана лимитом контекста, начало не
         видно: тогда о том, кто написал первым, судить нельзя.
+        style_block — выученная манера письма, пустая строка до накопления
+        данных.
         """
-        raw = self._complete(self._system_prompt, history, self._max_tokens,
+        prompt = self._system_prompt
+        if style_block:
+            prompt = build_system_prompt(self._tones, self._style, style_block)
+        raw = self._complete(prompt, history, self._max_tokens,
                              partner_name, full_history)
         variants = parse_suggestions(raw)
         if not variants:

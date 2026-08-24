@@ -13,7 +13,7 @@ from suflor.chat_filter import should_suggest, IncomingContext
 from suflor.suggester import Suggester, SuggesterError
 from suflor.matching import classify_sent
 from suflor.outcome import reply_stats, score_reply, has_question
-from suflor import store
+from suflor import store, profile
 from suflor.control_panel import (
     format_suggestions, format_error, build_chat_link, utf16_span,
 )
@@ -290,15 +290,18 @@ async def _handle_hint(client, cfg, suggester, event, arg: str, conn=None):
             parse_mode=None)
         return
 
+    chat_id = utils.get_peer_id(entity)
+    learned = (profile.style_block(conn, chat_id, cfg.tones)
+               if conn is not None else "")
     try:
         analysis, variants = await asyncio.to_thread(suggester.analyze,
-                                                     history, name, full)
+                                                     history, name, full,
+                                                     learned)
     except SuggesterError:
         await client.send_message(cfg.panel_chat, format_error(name),
                                   parse_mode=None)
         return
 
-    chat_id = utils.get_peer_id(entity)
     if conn is not None:
         store.save_suggestion(conn, chat_id, cfg.tones, variants,
                               history[-1]["text"])
@@ -383,10 +386,11 @@ async def _amain():
         resolve_outcomes(conn, event.chat_id, history, event.raw_text,
                          event.date, OUTCOME_WINDOW_HOURS)
 
+        learned = profile.style_block(conn, event.chat_id, cfg.tones)
         try:
             analysis, variants = await asyncio.to_thread(suggester.analyze,
                                                          history, sender_name,
-                                                         full)
+                                                         full, learned)
         except SuggesterError:
             await client.send_message(cfg.panel_chat, format_error(sender_name),
                                       parse_mode=None)
