@@ -3,6 +3,7 @@ import os
 import re
 import asyncio
 import getpass
+from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv
 from telethon import TelegramClient, errors, events, utils
 from telethon.tl import types
@@ -10,6 +11,9 @@ from telethon.tl import types
 from suflor.config import load_config
 from suflor.chat_filter import should_suggest, IncomingContext
 from suflor.suggester import Suggester, SuggesterError
+from suflor.matching import classify_sent
+from suflor.outcome import reply_stats, score_reply, has_question
+from suflor import store
 from suflor.control_panel import (
     format_suggestions, format_error, build_chat_link, utf16_span,
 )
@@ -17,6 +21,13 @@ from suflor.control_panel import (
 load_dotenv()
 
 CONFIG_PATH = os.getenv("SUFLOR_CONFIG", "config.yaml")
+DB_PATH = os.getenv("SUFLOR_DB", "suflor.db")
+
+# Насколько свежей должна быть подсказка, чтобы связывать её с отправленным,
+# и сколько ждём ответа, прежде чем считать, что его не будет.
+# Переезжают в config.yaml в задаче 8 плана.
+MATCH_WINDOW_MINUTES = 60
+OUTCOME_WINDOW_HOURS = 12
 
 # Глобальное состояние: включён ли суфлёр (управляется /on /off из пульта)
 STATE = {"enabled": True}
@@ -38,6 +49,59 @@ async def _collect_history(client, chat_id, limit):
                         "date": msg.date})
     history.reverse()  # от старых к новым
     return history, seen < limit
+
+
+def record_outgoing(conn, chat_id: int, text: str, sent_at: datetime,
+                    match_window_minutes: int = 60) -> int | None:
+    """Записать моё отправленное, определив, откуда оно взялось.
+
+    Подсказка привязывается только свежая: если я отвечаю через сутки после
+    неё, то почти наверняка пишу уже своё, а совпадение будет случайным.
+    """
+    if not (text or "").strip():
+        return None
+    suggestion = store.last_suggestion(conn, chat_id)
+    variants, suggestion_id = [], None
+    if suggestion:
+        age = sent_at - suggestion["created_at"]
+        if timedelta(0) <= age <= timedelta(minutes=match_window_minutes):
+            variants = suggestion["variants"]
+            suggestion_id = suggestion["id"]
+
+    source, index, _ = classify_sent(text, variants)
+    if source == "own":
+        # Своё сообщение с подсказкой не связано, даже если она была свежей
+        suggestion_id, index = None, None
+    return store.save_sent(conn, chat_id, text, source, suggestion_id, index,
+                           sent_at)
+
+
+def resolve_outcomes(conn, chat_id: int, history: list[dict],
+                     reply_text: str, replied_at: datetime,
+                     outcome_window_hours: int = 12) -> int:
+    """Закрыть исходы моих сообщений её ответом. Возвращает число закрытых.
+
+    Ответ на серию моих сообщений подряд засчитывается всем: это один мой
+    ход, разбитый на реплики.
+    """
+    median_delay, median_len = reply_stats(history)
+    window = timedelta(hours=outcome_window_hours).total_seconds()
+    closed = 0
+    for row in store.pending_outcomes(conn, chat_id):
+        sent_at = row["sent_at"]
+        if sent_at is None or replied_at < sent_at:
+            continue
+        delay = (replied_at - sent_at).total_seconds()
+        if delay <= window:
+            score = score_reply(int(delay), len(reply_text or ""),
+                                has_question(reply_text), median_delay,
+                                median_len)
+            store.save_outcome(conn, row["id"], replied_at, reply_text,
+                               int(delay), score)
+        else:
+            store.save_outcome(conn, row["id"], None, None, None, 0.0)
+        closed += 1
+    return closed
 
 
 def _ask_password(prompt_fn=getpass.getpass) -> str:
@@ -123,7 +187,7 @@ _HINT_USAGE = ("Не понял, какой чат. Пришли «/hint @userna
                "на пересланное сообщение.")
 
 
-async def _handle_hint(client, cfg, suggester, event, arg: str):
+async def _handle_hint(client, cfg, suggester, event, arg: str, conn=None):
     """Разбор уже существующего диалога по запросу из пульта."""
     if arg:
         target = parse_hint_target(arg)
@@ -157,10 +221,14 @@ async def _handle_hint(client, cfg, suggester, event, arg: str):
                                   parse_mode=None)
         return
 
+    chat_id = utils.get_peer_id(entity)
+    if conn is not None:
+        store.save_suggestion(conn, chat_id, cfg.tones, variants,
+                              history[-1]["text"])
+
     text, entities = await _build_panel_message(
-        client, name, getattr(entity, "username", None),
-        utils.get_peer_id(entity), history[-1]["text"], variants, analysis,
-        cfg.tones)
+        client, name, getattr(entity, "username", None), chat_id,
+        history[-1]["text"], variants, analysis, cfg.tones)
     await client.send_message(cfg.panel_chat, text,
                               formatting_entities=entities, parse_mode=None)
 
@@ -174,6 +242,11 @@ async def _amain():
     suggester = Suggester(api_key=deepseek_key, tones=cfg.tones,
                           style=cfg.style, temperature=cfg.temperature,
                           model=cfg.model)
+
+    conn = store.open_store(DB_PATH)
+    # Диалоги, заглохшие ещё до перезапуска, ответа уже не дождутся
+    store.expire_pending(conn, datetime.now(timezone.utc) -
+                         timedelta(hours=OUTCOME_WINDOW_HOURS))
 
     client = TelegramClient("suflor.session", api_id, api_hash)
 
@@ -198,8 +271,16 @@ async def _amain():
                 return
             if cmd == "/hint" or cmd.startswith("/hint "):
                 await _handle_hint(client, cfg, suggester, event,
-                                   cmd[len("/hint"):].strip())
+                                   cmd[len("/hint"):].strip(), conn)
                 return
+
+        # Моё сообщение в живом чате — образец манеры или выбор варианта.
+        # Пишется до фильтра should_suggest: тот режет исходящие, а нам они и
+        # нужны. Пульт исключён явно, иначе в корпус уедут /on и /hint.
+        if event.out and event.chat_id != panel_id and event.is_private:
+            record_outgoing(conn, event.chat_id, event.raw_text, event.date,
+                            MATCH_WINDOW_MINUTES)
+            return
 
         sender = await event.get_sender()
         ctx = _build_ctx(event, sender)
@@ -217,6 +298,10 @@ async def _amain():
 
         history, full = await _collect_history(client, event.chat_id,
                                                cfg.context_messages)
+        # Её ответ закрывает исходы моих предыдущих сообщений в этом чате
+        resolve_outcomes(conn, event.chat_id, history, event.raw_text,
+                         event.date, OUTCOME_WINDOW_HOURS)
+
         try:
             analysis, variants = await asyncio.to_thread(suggester.analyze,
                                                          history, sender_name,
@@ -225,6 +310,9 @@ async def _amain():
             await client.send_message(cfg.panel_chat, format_error(sender_name),
                                       parse_mode=None)
             return
+
+        store.save_suggestion(conn, event.chat_id, cfg.tones, variants,
+                              event.raw_text)
 
         text, entities = await _build_panel_message(
             client, sender_name, ctx.sender_username, ctx.sender_id,

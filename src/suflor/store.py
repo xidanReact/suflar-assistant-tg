@@ -133,13 +133,33 @@ def save_outcome(conn, sent_id: int, replied_at: datetime | None,
 
 
 def pending_outcomes(conn, chat_id: int) -> list[dict]:
-    """Мои сообщения в чате, по которым исход ещё не записан."""
+    """Мои сообщения в чате, ответа на которые мы ещё не видели.
+
+    Сюда попадает и то, что уже помечено «не ответила» по таймауту: ответ мог
+    прийти позже, и тогда нулевую оценку надо исправить. Записи с реальным
+    ответом не возвращаются — их исход окончателен.
+    """
     rows = conn.execute(
         "SELECT s.id, s.sent_at FROM sent s "
         "LEFT JOIN outcomes o ON o.sent_id = s.id "
-        "WHERE s.chat_id = ? AND o.sent_id IS NULL ORDER BY s.sent_at",
-        (chat_id,)).fetchall()
+        "WHERE s.chat_id = ? AND (o.sent_id IS NULL OR o.replied_at IS NULL) "
+        "ORDER BY s.sent_at", (chat_id,)).fetchall()
     return [{"id": r["id"], "sent_at": _dt(r["sent_at"])} for r in rows]
+
+
+def expire_pending(conn, older_than: datetime) -> int:
+    """Закрыть нулём всё, на что уже точно не ответят.
+
+    Нужно для диалогов, которые просто заглохли: без этого «меня проигнорили»
+    навсегда осталось бы без исхода и считалось бы средним по умолчанию.
+    """
+    cur = conn.execute(
+        "INSERT INTO outcomes (sent_id, replied_at, reply_text, delay_s, score) "
+        "SELECT s.id, NULL, NULL, NULL, 0.0 FROM sent s "
+        "LEFT JOIN outcomes o ON o.sent_id = s.id "
+        "WHERE o.sent_id IS NULL AND s.sent_at < ?", (_iso(older_than),))
+    conn.commit()
+    return cur.rowcount
 
 
 def style_samples(conn, chat_id: int | None = None,

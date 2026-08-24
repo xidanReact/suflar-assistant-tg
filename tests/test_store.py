@@ -2,7 +2,7 @@ from datetime import datetime, timedelta, timezone
 
 from suflor.store import (
     open_store, save_suggestion, last_suggestion, save_sent, sent_exists,
-    save_outcome, pending_outcomes, style_samples, tone_stats,
+    save_outcome, pending_outcomes, expire_pending, style_samples, tone_stats,
     suggestion_count, edited_pairs, forget_chat, learning_summary,
 )
 
@@ -154,6 +154,37 @@ def test_pending_outcomes_lists_only_unresolved(tmp_path):
     pending = pending_outcomes(conn, 1)
     assert [p["id"] for p in pending] == [waiting]
     assert pending[0]["sent_at"] == NOW
+
+
+def test_pending_outcomes_keep_unanswered_open_for_a_late_reply(tmp_path):
+    # Помеченное «не ответила» по таймауту должно вернуться в очередь: ответ
+    # мог прийти позже, и ноль надо будет исправить
+    conn = _store(tmp_path)
+    timed_out = save_sent(conn, 1, "молчание", "own", sent_at=NOW)
+    save_outcome(conn, timed_out, None, None, None, 0.0)
+    assert [p["id"] for p in pending_outcomes(conn, 1)] == [timed_out]
+
+
+def test_expire_pending_closes_only_the_old_ones(tmp_path):
+    conn = _store(tmp_path)
+    old = save_sent(conn, 1, "давнее", "own", sent_at=NOW - timedelta(days=1))
+    fresh = save_sent(conn, 1, "свежее", "own", sent_at=NOW)
+
+    assert expire_pending(conn, NOW - timedelta(hours=12)) == 1
+
+    samples = {s["id"]: s["score"] for s in style_samples(conn)}
+    assert samples[old] == 0.0
+    assert samples[fresh] == 0.5      # исхода нет — значение по умолчанию
+
+
+def test_expire_pending_does_not_touch_answered(tmp_path):
+    conn = _store(tmp_path)
+    answered = save_sent(conn, 1, "давнее", "own", sent_at=NOW - timedelta(days=1))
+    save_outcome(conn, answered, NOW, "ответ", 60, 0.9)
+
+    expire_pending(conn, NOW)
+
+    assert style_samples(conn)[0]["score"] == 0.9
 
 
 def test_save_outcome_overwrites_the_previous_verdict(tmp_path):
