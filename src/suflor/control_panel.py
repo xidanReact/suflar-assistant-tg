@@ -1,5 +1,4 @@
-_TONES = ["игривый", "тёплый", "с юмором"]
-_NUMS = ["1⃣", "2⃣", "3⃣"]
+_NUMS = ["1⃣", "2⃣", "3⃣", "4⃣", "5⃣"]
 
 
 def utf16_span(text: str, fragment: str) -> tuple[int, int] | None:
@@ -27,7 +26,9 @@ def build_chat_link(username: str | None, sender_id: int) -> str:
 
 def format_suggestions(sender_name: str, last_text: str, variants: list[str],
                        chat_link: str | None = None,
-                       analysis: str | None = None) -> str:
+                       analysis: str | None = None,
+                       tones: list[str] | None = None) -> str:
+    tones = tones or []
     head = f"\U0001f4ac {sender_name}"
     if chat_link:
         head += f" — {chat_link}"
@@ -35,7 +36,7 @@ def format_suggestions(sender_name: str, last_text: str, variants: list[str],
     if analysis:
         lines += [f"\U0001f4ca {analysis}", ""]
     for i, v in enumerate(variants):
-        tone = _TONES[i] if i < len(_TONES) else ""
+        tone = tones[i] if i < len(tones) else ""
         num = _NUMS[i] if i < len(_NUMS) else f"{i + 1})"
         tag = f" [{tone}]" if tone else ""
         lines.append(f"{num}{tag} {v}")

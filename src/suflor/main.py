@@ -27,7 +27,8 @@ async def _collect_history(client, chat_id, limit):
     async for msg in client.iter_messages(chat_id, limit=limit):
         if not msg.text:
             continue
-        history.append({"from_me": bool(msg.out), "text": msg.text})
+        history.append({"from_me": bool(msg.out), "text": msg.text,
+                        "date": msg.date})
     history.reverse()  # от старых к новым
     return history
 
@@ -58,7 +59,8 @@ def _build_ctx(event, sender) -> IncomingContext:
 
 async def _build_panel_message(client, sender_name: str, username: str | None,
                                sender_id: int, last_text: str,
-                               variants: list[str], analysis: str = None):
+                               variants: list[str], analysis: str = None,
+                               tones: list[str] = None):
     """Текст подсказки и сущности форматирования, делающие имя кликабельным.
 
     С username хватает обычной ссылки t.me. Без него единственный способ
@@ -75,7 +77,7 @@ async def _build_panel_message(client, sender_name: str, username: str | None,
     clickable = bool(username) or peer is not None
     fallback = None if clickable else build_chat_link(username, sender_id)
     text = format_suggestions(sender_name, last_text, variants, fallback,
-                              analysis)
+                              analysis, tones)
     if not clickable:
         return text, None
 
@@ -149,7 +151,8 @@ async def _handle_hint(client, cfg, suggester, event, arg: str):
 
     text, entities = await _build_panel_message(
         client, name, getattr(entity, "username", None),
-        utils.get_peer_id(entity), history[-1]["text"], variants, analysis)
+        utils.get_peer_id(entity), history[-1]["text"], variants, analysis,
+        cfg.tones)
     await client.send_message(cfg.panel_chat, text,
                               formatting_entities=entities, parse_mode=None)
 
@@ -160,7 +163,8 @@ async def _amain():
     deepseek_key = os.environ["DEEPSEEK_API_KEY"]
 
     cfg = load_config(CONFIG_PATH)
-    suggester = Suggester(api_key=deepseek_key)
+    suggester = Suggester(api_key=deepseek_key, tones=cfg.tones,
+                          style=cfg.style)
 
     client = TelegramClient("suflor.session", api_id, api_hash)
 
@@ -213,7 +217,7 @@ async def _amain():
 
         text, entities = await _build_panel_message(
             client, sender_name, ctx.sender_username, ctx.sender_id,
-            event.raw_text, variants, analysis)
+            event.raw_text, variants, analysis, cfg.tones)
         await client.send_message(cfg.panel_chat, text,
                                   formatting_entities=entities,
                                   parse_mode=None)
