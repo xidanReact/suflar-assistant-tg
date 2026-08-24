@@ -143,7 +143,8 @@ async def _handle_hint(client, cfg, suggester, event, arg: str):
         return
 
     try:
-        analysis, variants = await asyncio.to_thread(suggester.analyze, history)
+        analysis, variants = await asyncio.to_thread(suggester.analyze,
+                                                     history, name)
     except SuggesterError:
         await client.send_message(cfg.panel_chat, format_error(name),
                                   parse_mode=None)
@@ -164,7 +165,8 @@ async def _amain():
 
     cfg = load_config(CONFIG_PATH)
     suggester = Suggester(api_key=deepseek_key, tones=cfg.tones,
-                          style=cfg.style)
+                          style=cfg.style, temperature=cfg.temperature,
+                          model=cfg.model)
 
     client = TelegramClient("suflor.session", api_id, api_hash)
 
@@ -209,7 +211,7 @@ async def _amain():
         history = await _collect_history(client, event.chat_id, cfg.context_messages)
         try:
             analysis, variants = await asyncio.to_thread(suggester.analyze,
-                                                         history)
+                                                         history, sender_name)
         except SuggesterError:
             await client.send_message(cfg.panel_chat, format_error(sender_name),
                                       parse_mode=None)

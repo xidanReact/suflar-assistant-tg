@@ -44,6 +44,18 @@ def test_build_messages_ignores_short_pauses():
     assert "пауза" not in body
 
 
+def test_build_messages_uses_partner_name():
+    body = build_messages([_msg("привет", 5)], "промпт", now=NOW,
+                          partner_name="Аня")[-1]["content"]
+    assert "Аня: привет" in body
+    assert "Собеседник:" not in body
+
+
+def test_build_messages_falls_back_to_generic_partner():
+    body = build_messages([_msg("привет", 5)], "промпт", now=NOW)[-1]["content"]
+    assert "Собеседник: привет" in body
+
+
 def test_build_messages_works_without_dates():
     body = build_messages([{"from_me": False, "text": "привет"}],
                           "промпт", now=NOW)[-1]["content"]
@@ -95,20 +107,28 @@ def _bare_suggester():
     s = Suggester.__new__(Suggester)
     s._model = "deepseek-chat"
     s._system_prompt = "системный промпт"
+    s._temperature = 0.7
     s._max_tokens = 700
     return s
 
 
-def _make_suggester_with_reply(text):
+def _make_suggester_with_reply(text, finish_reason="stop"):
     s = _bare_suggester()
     client = MagicMock()
     msg = MagicMock()
     msg.content = text
-    client.chat.completions.create.return_value = MagicMock(
-        choices=[MagicMock(message=msg)]
-    )
+    choice = MagicMock(message=msg, finish_reason=finish_reason)
+    client.chat.completions.create.return_value = MagicMock(choices=[choice])
     s._client = client
     return s
+
+
+def test_analyze_reports_when_reasoning_ate_the_token_budget():
+    # V4 тратит токены на рассуждения; если лимит кончился раньше ответа,
+    # content приходит пустым — ошибка должна называть настоящую причину
+    s = _make_suggester_with_reply("", finish_reason="length")
+    with pytest.raises(SuggesterError, match="max_tokens"):
+        s.analyze([{"from_me": False, "text": "хай"}])
 
 
 def test_analyze_raises_on_api_error():

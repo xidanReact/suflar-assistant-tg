@@ -11,6 +11,9 @@ _ANALYSIS_LABEL = re.compile(
 # Пауза, начиная с которой она заметна в переписке и стоит упоминания
 _PAUSE_THRESHOLD = 3600
 
+# Замерено на deepseek-v4-flash и -pro: рассуждения занимают 1900–3900 токенов
+_REASONING_BUDGET = 6000
+
 
 class SuggesterError(Exception):
     pass
@@ -71,6 +74,15 @@ def build_system_prompt(tones: list[str], style: str) -> str:
         "продолжать фразу как ни в чём не бывало, но и извиняться за молчание "
         "не нужно, если пауза небольшая. Учитывай время суток, если оно видно "
         "по переписке. "
+        "Опирайся только на то, что реально сказано в переписке. Не выдумывай "
+        "фактов обо мне и о собеседнике: общих воспоминаний, планов, мест, "
+        "имён, деталей биографии, которых в диалоге нет. Если известно мало — "
+        "пиши проще и короче, а не сочиняй подробности. "
+        "Не переигрывай. Никакого пафоса, наигранного остроумия, заготовок в "
+        "духе пикап-фраз, нагромождения шуток и метафор. Одна мысль на "
+        "сообщение. Лучше проще и живее, чем эффектнее. "
+        "Каждый вариант — одна-две короткие фразы, как реально пишут в "
+        "мессенджере, а не абзац. "
         f"{style} "
         "Каждый вариант — на отдельной строке в формате '1) текст', "
         "'2) текст', без лишних пояснений."
@@ -78,11 +90,13 @@ def build_system_prompt(tones: list[str], style: str) -> str:
 
 
 def build_messages(history: list[dict], system_prompt: str,
-                   now: datetime | None = None) -> list[dict]:
+                   now: datetime | None = None,
+                   partner_name: str | None = None) -> list[dict]:
     """Диалог для модели: реплики, заметные паузы между ними и время,
     прошедшее с последнего сообщения.
     """
     now = now or datetime.now(timezone.utc)
+    partner = partner_name or "Собеседник"
     lines = []
     prev = None
     for m in history:
@@ -91,7 +105,7 @@ def build_messages(history: list[dict], system_prompt: str,
             gap = (date - prev).total_seconds()
             if gap >= _PAUSE_THRESHOLD:
                 lines.append(f"[пауза {humanize_delta(gap)}]")
-        who = "Я" if m["from_me"] else "Собеседник"
+        who = "Я" if m["from_me"] else partner
         lines.append(f"{who}: {m['text']}")
         prev = date or prev
 
@@ -135,29 +149,43 @@ def parse_analysis(raw: str) -> str:
 
 class Suggester:
     def __init__(self, api_key: str, tones: list[str], style: str,
-                 model: str = "deepseek-chat"):
+                 temperature: float = 0.7,
+                 model: str = "deepseek-v4-pro"):
         self._client = OpenAI(api_key=api_key, base_url="https://api.deepseek.com")
         self._model = model
         self._system_prompt = build_system_prompt(tones, style)
-        # разбор плюс сами варианты: чем больше тонов, тем длиннее ответ
-        self._max_tokens = 400 + 100 * len(tones)
+        self._temperature = temperature
+        # DeepSeek V4 — рассуждающие модели: внутренние рассуждения списываются
+        # из того же max_tokens, что и ответ, и съедают несколько тысяч токенов.
+        # Без запаса поверх них content приходит пустым, а finish_reason=length.
+        self._max_tokens = _REASONING_BUDGET + 500 * len(tones)
 
     def _complete(self, system_prompt: str, history: list[dict],
-                  max_tokens: int) -> str:
+                  max_tokens: int, partner_name: str | None = None) -> str:
         try:
             resp = self._client.chat.completions.create(
                 model=self._model,
-                messages=build_messages(history, system_prompt),
-                temperature=0.9,
+                messages=build_messages(history, system_prompt,
+                                        partner_name=partner_name),
+                temperature=self._temperature,
                 max_tokens=max_tokens,
             )
         except Exception as e:
             raise SuggesterError(str(e)) from e
-        return resp.choices[0].message.content or ""
 
-    def analyze(self, history: list[dict]) -> tuple[str, list[str]]:
+        choice = resp.choices[0]
+        content = choice.message.content or ""
+        if not content and choice.finish_reason == "length":
+            raise SuggesterError(
+                "рассуждения модели съели весь max_tokens, на ответ не "
+                "осталось места — увеличь лимит")
+        return content
+
+    def analyze(self, history: list[dict],
+                partner_name: str | None = None) -> tuple[str, list[str]]:
         """Разбор диалога плюс варианты следующего сообщения."""
-        raw = self._complete(self._system_prompt, history, self._max_tokens)
+        raw = self._complete(self._system_prompt, history, self._max_tokens,
+                             partner_name)
         variants = parse_suggestions(raw)
         if not variants:
             raise SuggesterError("модель вернула пустой/неразборчивый ответ")
