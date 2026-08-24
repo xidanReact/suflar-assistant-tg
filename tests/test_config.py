@@ -69,3 +69,37 @@ def test_load_config_applies_defaults(tmp_path):
     assert cfg.model == DEFAULT_MODEL
     assert cfg.ignore_usernames == []
     assert cfg.ignore_user_ids == []
+
+
+def test_learning_defaults_when_section_is_absent(tmp_path):
+    # Конфиг, написанный до самообучения, должен продолжать работать
+    cfg_file = tmp_path / "config.yaml"
+    cfg_file.write_text("panel_chat: me\n", encoding="utf-8")
+    learning = load_config(str(cfg_file)).learning
+    assert learning.enabled is True
+    assert learning.min_samples == 5
+    assert learning.outcome_window_hours == 12
+
+
+def test_learning_reads_overrides(tmp_path):
+    cfg_file = tmp_path / "config.yaml"
+    cfg_file.write_text(
+        "panel_chat: me\n"
+        "learning:\n"
+        "  enabled: false\n"
+        "  min_samples: 20\n"
+        "  train_chats: 3\n",
+        encoding="utf-8")
+    learning = load_config(str(cfg_file)).learning
+    assert learning.enabled is False
+    assert learning.min_samples == 20
+    assert learning.train_chats == 3
+    assert learning.style_examples == 8      # не заданное осталось дефолтным
+
+
+def test_learning_ignores_unknown_keys(tmp_path):
+    # Опечатка в конфиге не должна ронять запуск бота
+    cfg_file = tmp_path / "config.yaml"
+    cfg_file.write_text("panel_chat: me\nlearning:\n  min_smaples: 3\n",
+                        encoding="utf-8")
+    assert load_config(str(cfg_file)).learning.min_samples == 5

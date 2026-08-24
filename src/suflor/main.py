@@ -15,7 +15,8 @@ from suflor.matching import classify_sent
 from suflor.outcome import reply_stats, score_reply, has_question
 from suflor import store, profile
 from suflor.control_panel import (
-    format_suggestions, format_error, build_chat_link, utf16_span,
+    format_suggestions, format_error, format_stats, build_chat_link,
+    utf16_span,
 )
 
 load_dotenv()
@@ -23,18 +24,10 @@ load_dotenv()
 CONFIG_PATH = os.getenv("SUFLOR_CONFIG", "config.yaml")
 DB_PATH = os.getenv("SUFLOR_DB", "suflor.db")
 
-# Насколько свежей должна быть подсказка, чтобы связывать её с отправленным,
-# и сколько ждём ответа, прежде чем считать, что его не будет.
-# Переезжают в config.yaml в задаче 8 плана.
-MATCH_WINDOW_MINUTES = 60
-OUTCOME_WINDOW_HOURS = 12
-
-# Сколько диалогов просматривает /train и сколько сообщений берёт из каждого
-TRAIN_CHATS_SCAN = 20
-TRAIN_MESSAGES = 200
-
-# Глобальное состояние: включён ли суфлёр (управляется /on /off из пульта)
-STATE = {"enabled": True}
+# Глобальное состояние: включён ли суфлёр (/on /off) и копится ли корпус
+# самообучения (/learn on|off). Оба сбрасываются к значениям конфига при
+# перезапуске.
+STATE = {"enabled": True, "learning": True}
 
 
 async def _collect_history(client, chat_id, limit):
@@ -191,6 +184,38 @@ _HINT_USAGE = ("Не понял, какой чат. Пришли «/hint @userna
                "на пересланное сообщение.")
 
 
+def _learned_style(conn, cfg, chat_id: int) -> str:
+    """Выученная манера для этого диалога. Пусто, если обучение выключено."""
+    if conn is None or not STATE["learning"]:
+        return ""
+    return profile.style_block(conn, chat_id, cfg.tones,
+                               max_samples=cfg.learning.style_examples,
+                               chat_quota=cfg.learning.chat_examples,
+                               min_samples=cfg.learning.min_samples)
+
+
+async def _handle_forget(client, conn, cfg, arg: str):
+    """Стереть из базы всё, что связано с человеком."""
+    target = parse_hint_target(arg) if arg else None
+    if target is None:
+        await client.send_message(
+            cfg.panel_chat,
+            "Кого забыть? «/forget @username» или «/forget 123456789».",
+            parse_mode=None)
+        return
+    try:
+        entity = await client.get_entity(target)
+    except (ValueError, TypeError, errors.RPCError):
+        await client.send_message(cfg.panel_chat, f"Не нашёл диалог: {arg}",
+                                  parse_mode=None)
+        return
+    name = utils.get_display_name(entity) or str(target)
+    store.forget_chat(conn, utils.get_peer_id(entity))
+    await client.send_message(
+        cfg.panel_chat, f"Забыл всё, что собрал по диалогу с {name}.",
+        parse_mode=None)
+
+
 async def harvest_chat(client, conn, entity, chat_id: int, limit: int) -> int:
     """Собрать мои сообщения из истории одного диалога. Возвращает число новых.
 
@@ -228,6 +253,7 @@ def _is_harvestable(dialog, cfg) -> bool:
 
 async def _handle_train(client, conn, cfg, arg: str):
     """Собрать корпус моей манеры из уже существующей переписки."""
+    limit = cfg.learning.train_messages
     if arg:
         target = parse_hint_target(arg)
         try:
@@ -239,7 +265,7 @@ async def _handle_train(client, conn, cfg, arg: str):
                                       f"Не нашёл диалог: {arg}", parse_mode=None)
             return
         added = await harvest_chat(client, conn, entity,
-                                   utils.get_peer_id(entity), TRAIN_MESSAGES)
+                                   utils.get_peer_id(entity), limit)
         name = utils.get_display_name(entity) or str(target)
         await client.send_message(
             cfg.panel_chat,
@@ -250,12 +276,11 @@ async def _handle_train(client, conn, cfg, arg: str):
     await client.send_message(cfg.panel_chat, "Собираю корпус, это небыстро…",
                               parse_mode=None)
     total, chats = 0, 0
-    async for dialog in client.iter_dialogs(limit=TRAIN_CHATS_SCAN):
+    async for dialog in client.iter_dialogs(limit=cfg.learning.train_chats):
         if not _is_harvestable(dialog, cfg):
             continue
         added = await harvest_chat(client, conn, dialog.entity,
-                                   utils.get_peer_id(dialog.entity),
-                                   TRAIN_MESSAGES)
+                                   utils.get_peer_id(dialog.entity), limit)
         if added:
             chats += 1
             total += added
@@ -291,8 +316,7 @@ async def _handle_hint(client, cfg, suggester, event, arg: str, conn=None):
         return
 
     chat_id = utils.get_peer_id(entity)
-    learned = (profile.style_block(conn, chat_id, cfg.tones)
-               if conn is not None else "")
+    learned = _learned_style(conn, cfg, chat_id)
     try:
         analysis, variants = await asyncio.to_thread(suggester.analyze,
                                                      history, name, full,
@@ -302,7 +326,7 @@ async def _handle_hint(client, cfg, suggester, event, arg: str, conn=None):
                                   parse_mode=None)
         return
 
-    if conn is not None:
+    if conn is not None and STATE["learning"]:
         store.save_suggestion(conn, chat_id, cfg.tones, variants,
                               history[-1]["text"])
 
@@ -325,8 +349,9 @@ async def _amain():
 
     conn = store.open_store(DB_PATH)
     # Диалоги, заглохшие ещё до перезапуска, ответа уже не дождутся
+    STATE["learning"] = cfg.learning.enabled
     store.expire_pending(conn, datetime.now(timezone.utc) -
-                         timedelta(hours=OUTCOME_WINDOW_HOURS))
+                         timedelta(hours=cfg.learning.outcome_window_hours))
 
     client = TelegramClient("suflor.session", api_id, api_hash)
 
@@ -357,13 +382,32 @@ async def _amain():
                 await _handle_train(client, conn, cfg,
                                     cmd[len("/train"):].strip())
                 return
+            if cmd == "/stats":
+                await client.send_message(
+                    cfg.panel_chat,
+                    format_stats(store.learning_summary(conn),
+                                 cfg.learning.min_samples), parse_mode=None)
+                return
+            if cmd in ("/learn on", "/learn off"):
+                STATE["learning"] = cmd.endswith("on")
+                state = "копится" if STATE["learning"] else "остановлен"
+                await client.send_message(
+                    cfg.panel_chat, f"Корпус самообучения {state}.",
+                    parse_mode=None)
+                return
+            if cmd == "/forget" or cmd.startswith("/forget "):
+                await _handle_forget(client, conn, cfg,
+                                     cmd[len("/forget"):].strip())
+                return
 
         # Моё сообщение в живом чате — образец манеры или выбор варианта.
         # Пишется до фильтра should_suggest: тот режет исходящие, а нам они и
         # нужны. Пульт исключён явно, иначе в корпус уедут /on и /hint.
         if event.out and event.chat_id != panel_id and event.is_private:
-            record_outgoing(conn, event.chat_id, event.raw_text, event.date,
-                            MATCH_WINDOW_MINUTES)
+            if STATE["learning"]:
+                record_outgoing(conn, event.chat_id, event.raw_text,
+                                event.date,
+                                cfg.learning.match_window_minutes)
             return
 
         sender = await event.get_sender()
@@ -383,10 +427,11 @@ async def _amain():
         history, full = await _collect_history(client, event.chat_id,
                                                cfg.context_messages)
         # Её ответ закрывает исходы моих предыдущих сообщений в этом чате
-        resolve_outcomes(conn, event.chat_id, history, event.raw_text,
-                         event.date, OUTCOME_WINDOW_HOURS)
+        if STATE["learning"]:
+            resolve_outcomes(conn, event.chat_id, history, event.raw_text,
+                             event.date, cfg.learning.outcome_window_hours)
 
-        learned = profile.style_block(conn, event.chat_id, cfg.tones)
+        learned = _learned_style(conn, cfg, event.chat_id)
         try:
             analysis, variants = await asyncio.to_thread(suggester.analyze,
                                                          history, sender_name,
@@ -396,8 +441,9 @@ async def _amain():
                                       parse_mode=None)
             return
 
-        store.save_suggestion(conn, event.chat_id, cfg.tones, variants,
-                              event.raw_text)
+        if STATE["learning"]:
+            store.save_suggestion(conn, event.chat_id, cfg.tones, variants,
+                                  event.raw_text)
 
         text, entities = await _build_panel_message(
             client, sender_name, ctx.sender_username, ctx.sender_id,
@@ -407,7 +453,8 @@ async def _amain():
                                   parse_mode=None)
 
     print(f"Готово. Подсказки идут в: {cfg.panel_chat}. "
-          "Управление: /on /off, разбор чата: /hint")
+          "Управление: /on /off, разбор чата: /hint, "
+          "самообучение: /train /stats /learn /forget")
     await client.run_until_disconnected()
 
 

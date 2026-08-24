@@ -43,6 +43,30 @@ def format_suggestions(sender_name: str, last_text: str, variants: list[str],
     return "\n".join(lines)
 
 
+def format_stats(summary: dict, min_samples: int) -> str:
+    """Что бот успел выучить — ответ на /stats."""
+    samples = summary["samples"]
+    lines = [f"\U0001f9e0 Моих сообщений в корпусе: {samples} "
+             f"(из {summary['sent']} отправленных, {summary['chats']} диалогов)"]
+    if samples < min_samples:
+        lines.append(f"Профиль ещё не собирается: нужно минимум {min_samples}. "
+                     "Собрать из истории — /train")
+
+    lines.append(f"Подсказок выдано: {summary['suggestions']}")
+    tones = summary.get("tones") or {}
+    if tones:
+        picked = ", ".join(f"{tone} — {n}"
+                           for tone, n in sorted(tones.items(),
+                                                 key=lambda kv: -kv[1]))
+        lines.append(f"Выбранные тона: {picked}")
+    else:
+        lines.append("Выбранных вариантов пока нет — пишу своё")
+
+    if summary.get("avg_score") is not None:
+        lines.append(f"Средняя оценка ответов: {summary['avg_score']:.2f}")
+    return "\n".join(lines)
+
+
 def format_error(sender_name: str) -> str:
     return (
         f"⚠️ Не смог сгенерировать варианты для чата с {sender_name}. "
