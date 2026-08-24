@@ -5,3 +5,4 @@ __pycache__/
 .env
 *.session
 *.session-journal
+*.egg-info/
