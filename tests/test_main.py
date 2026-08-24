@@ -3,6 +3,7 @@ from types import SimpleNamespace
 
 from suflor.main import (
     _ask_password, _collect_history, record_outgoing, resolve_outcomes,
+    harvest_chat, _is_harvestable,
 )
 from suflor.store import open_store, save_suggestion, style_samples, tone_stats
 
@@ -180,3 +181,85 @@ def test_resolve_outcomes_upgrades_a_late_reply(tmp_path):
 
     resolve_outcomes(conn, 1, [], "ответ", NOW + timedelta(minutes=30))
     assert style_samples(conn)[0]["score"] == 0.5
+
+
+def _harvest_message(text, out=True, minutes_ago=0):
+    return SimpleNamespace(text=text, out=out,
+                           date=NOW - timedelta(minutes=minutes_ago))
+
+
+class _HistoryClient:
+    def __init__(self, messages):
+        self._messages = messages
+
+    def iter_messages(self, entity, limit):
+        async def gen():
+            for m in self._messages[:limit]:
+                yield m
+        return gen()
+
+
+async def test_harvest_takes_only_my_texts(tmp_path):
+    conn = _conn(tmp_path)
+    client = _HistoryClient([_harvest_message("моё", minutes_ago=1),
+                             _harvest_message("её", out=False, minutes_ago=2),
+                             _harvest_message(None, minutes_ago=3),
+                             _harvest_message("   ", minutes_ago=4)])
+
+    assert await harvest_chat(client, conn, object(), 1, limit=10) == 1
+    assert [s["text"] for s in style_samples(conn)] == ["моё"]
+
+
+async def test_harvest_is_idempotent(tmp_path):
+    conn = _conn(tmp_path)
+    client = _HistoryClient([_harvest_message("моё", minutes_ago=1)])
+
+    assert await harvest_chat(client, conn, object(), 1, limit=10) == 1
+    assert await harvest_chat(client, conn, object(), 1, limit=10) == 0
+    assert len(style_samples(conn)) == 1
+
+
+async def test_harvest_does_not_relabel_a_chosen_variant(tmp_path):
+    # Бот уже записал это сообщение как выбранный вариант — /train не должен
+    # превращать текст модели в образец моей манеры
+    conn = _with_suggestion(tmp_path)
+    sent_at = NOW + timedelta(minutes=2)
+    record_outgoing(conn, 1, VARIANTS[1], sent_at)
+    client = _HistoryClient([SimpleNamespace(text=VARIANTS[1], out=True,
+                                             date=sent_at)])
+
+    assert await harvest_chat(client, conn, object(), 1, limit=10) == 0
+    assert style_samples(conn) == []
+
+
+def _dialog(is_user=True, bot=False, is_self=False, uid=5, username="anna"):
+    entity = SimpleNamespace(bot=bot, is_self=is_self, id=uid,
+                             username=username)
+    return SimpleNamespace(is_user=is_user, entity=entity)
+
+
+def _train_cfg(**kw):
+    from suflor.config import Config
+    return Config(panel_chat="me", **kw)
+
+
+def test_harvestable_accepts_a_normal_person():
+    assert _is_harvestable(_dialog(), _train_cfg()) is True
+
+
+def test_harvestable_skips_groups_bots_and_saved_messages():
+    cfg = _train_cfg()
+    assert _is_harvestable(_dialog(is_user=False), cfg) is False
+    assert _is_harvestable(_dialog(bot=True), cfg) is False
+    assert _is_harvestable(_dialog(is_self=True), cfg) is False
+
+
+def test_harvestable_respects_the_ignore_list():
+    assert _is_harvestable(_dialog(username="mom"),
+                           _train_cfg(ignore_usernames=["mom"])) is False
+    assert _is_harvestable(_dialog(uid=7),
+                           _train_cfg(ignore_user_ids=[7])) is False
+
+
+def test_harvestable_handles_a_person_without_username():
+    assert _is_harvestable(_dialog(username=None), _train_cfg()) is True

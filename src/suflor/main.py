@@ -29,6 +29,10 @@ DB_PATH = os.getenv("SUFLOR_DB", "suflor.db")
 MATCH_WINDOW_MINUTES = 60
 OUTCOME_WINDOW_HOURS = 12
 
+# Сколько диалогов просматривает /train и сколько сообщений берёт из каждого
+TRAIN_CHATS_SCAN = 20
+TRAIN_MESSAGES = 200
+
 # Глобальное состояние: включён ли суфлёр (управляется /on /off из пульта)
 STATE = {"enabled": True}
 
@@ -187,6 +191,79 @@ _HINT_USAGE = ("Не понял, какой чат. Пришли «/hint @userna
                "на пересланное сообщение.")
 
 
+async def harvest_chat(client, conn, entity, chat_id: int, limit: int) -> int:
+    """Собрать мои сообщения из истории одного диалога. Возвращает число новых.
+
+    Уже известные сообщения пропускаются по времени отправки — повторный
+    /train не должен плодить дубли и, главное, не должен переписывать в «own»
+    то, что бот уже записал как выбранный вариант.
+    """
+    added = 0
+    async for msg in client.iter_messages(entity, limit=limit):
+        if not msg.out or not msg.text or not msg.text.strip():
+            continue
+        if store.sent_exists(conn, chat_id, msg.date):
+            continue
+        store.save_sent(conn, chat_id, msg.text, "own", sent_at=msg.date)
+        added += 1
+    return added
+
+
+def _is_harvestable(dialog, cfg) -> bool:
+    """Личный диалог живого человека, не пульт и не из игнор-листа.
+
+    Игнор-лист уважается намеренно: переписка с мамой — тоже мой текст, но
+    совсем другого регистра, и в образцах для знакомств она только мешает.
+    """
+    entity = dialog.entity
+    if not dialog.is_user or getattr(entity, "bot", False):
+        return False
+    if getattr(entity, "is_self", False):
+        return False
+    if getattr(entity, "id", None) in cfg.ignore_user_ids:
+        return False
+    username = getattr(entity, "username", None)
+    return not (username and username in cfg.ignore_usernames)
+
+
+async def _handle_train(client, conn, cfg, arg: str):
+    """Собрать корпус моей манеры из уже существующей переписки."""
+    if arg:
+        target = parse_hint_target(arg)
+        try:
+            entity = await client.get_entity(target) if target else None
+        except (ValueError, TypeError, errors.RPCError):
+            entity = None
+        if entity is None:
+            await client.send_message(cfg.panel_chat,
+                                      f"Не нашёл диалог: {arg}", parse_mode=None)
+            return
+        added = await harvest_chat(client, conn, entity,
+                                   utils.get_peer_id(entity), TRAIN_MESSAGES)
+        name = utils.get_display_name(entity) or str(target)
+        await client.send_message(
+            cfg.panel_chat,
+            f"Собрал {added} моих сообщений из диалога с {name}.",
+            parse_mode=None)
+        return
+
+    await client.send_message(cfg.panel_chat, "Собираю корпус, это небыстро…",
+                              parse_mode=None)
+    total, chats = 0, 0
+    async for dialog in client.iter_dialogs(limit=TRAIN_CHATS_SCAN):
+        if not _is_harvestable(dialog, cfg):
+            continue
+        added = await harvest_chat(client, conn, dialog.entity,
+                                   utils.get_peer_id(dialog.entity),
+                                   TRAIN_MESSAGES)
+        if added:
+            chats += 1
+            total += added
+    await client.send_message(
+        cfg.panel_chat,
+        f"Собрал {total} моих сообщений из {chats} диалогов.", parse_mode=None)
+
+
 async def _handle_hint(client, cfg, suggester, event, arg: str, conn=None):
     """Разбор уже существующего диалога по запросу из пульта."""
     if arg:
@@ -272,6 +349,10 @@ async def _amain():
             if cmd == "/hint" or cmd.startswith("/hint "):
                 await _handle_hint(client, cfg, suggester, event,
                                    cmd[len("/hint"):].strip(), conn)
+                return
+            if cmd == "/train" or cmd.startswith("/train "):
+                await _handle_train(client, conn, cfg,
+                                    cmd[len("/train"):].strip())
                 return
 
         # Моё сообщение в живом чате — образец манеры или выбор варианта.

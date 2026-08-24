@@ -191,6 +191,12 @@ def test_build_system_prompt_forbids_bouncing_the_same_question_back():
     assert "Вопросы, которые уже звучали" not in prompt  # это блок в user-части
 
 
+def test_build_system_prompt_forbids_rephrasing_answered_questions():
+    prompt = build_system_prompt(["дерзкий"], "стиль")
+    assert "по смыслу, а не по буквам" in prompt
+    assert "Переформулировка".lower() in prompt.lower()
+
+
 def test_build_system_prompt_asks_to_analyze_initiative():
     prompt = build_system_prompt(["дерзкий"], "стиль")
     assert "инициативу" in prompt.lower()
