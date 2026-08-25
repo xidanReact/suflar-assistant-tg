@@ -191,6 +191,12 @@ def test_build_system_prompt_forbids_bouncing_the_same_question_back():
     assert "Вопросы, которые уже звучали" not in prompt  # это блок в user-части
 
 
+def test_build_system_prompt_forbids_rephrasing_answered_questions():
+    prompt = build_system_prompt(["дерзкий"], "стиль")
+    assert "по смыслу, а не по буквам" in prompt
+    assert "Переформулировка".lower() in prompt.lower()
+
+
 def test_build_system_prompt_asks_to_analyze_initiative():
     prompt = build_system_prompt(["дерзкий"], "стиль")
     assert "инициативу" in prompt.lower()
@@ -238,6 +244,7 @@ def _bare_suggester():
     s = Suggester.__new__(Suggester)
     s._model = "deepseek-chat"
     s._system_prompt = "системный промпт"
+    s._about = ""
     s._temperature = 0.7
     s._max_tokens = 700
     return s
@@ -306,3 +313,119 @@ def test_analyze_raises_when_reply_has_no_variants():
     s = _make_suggester_with_reply("только разбор, вариантов нет")
     with pytest.raises(SuggesterError):
         s.analyze([{"from_me": True, "text": "хай"}])
+
+
+def test_empty_style_block_keeps_the_prompt_unchanged():
+    # Регрессия: пока профиль пуст, поведение должно быть ровно прежним
+    assert (build_system_prompt(["дерзкий"], "стиль", "")
+            == build_system_prompt(["дерзкий"], "стиль"))
+
+
+def test_style_block_goes_after_the_configured_style():
+    block = "Вот как я пишу сам:\n- «норм, отдыхаю»"
+    prompt = build_system_prompt(["дерзкий"], "МАНЕРА ИЗ КОНФИГА", block)
+    assert block in prompt
+    assert prompt.index("МАНЕРА ИЗ КОНФИГА") < prompt.index(block)
+
+
+def test_style_block_does_not_override_the_response_format():
+    block = "Вот как я пишу сам:\n- «норм»"
+    prompt = build_system_prompt(["дерзкий"], "стиль", block)
+    assert "'1) текст'" in prompt
+    assert prompt.index(block) < prompt.index("'1) текст'")
+
+
+def test_style_block_does_not_override_the_flirt_ceiling():
+    prompt = build_system_prompt(["дерзкий"], "стиль", "Вот как я пишу сам:")
+    assert "пошлый подтекст — нет" in prompt
+
+
+def test_analyze_passes_the_style_block_into_the_prompt():
+    s = _make_suggester_with_reply("Разбор.\n1) А")
+    s._tones = ["дерзкий"]
+    s._style = "стиль"
+    s.analyze([{"from_me": False, "text": "хай"}],
+              style_block="Вот как я пишу сам:\n- «норм»")
+    sent = s._client.chat.completions.create.call_args.kwargs["messages"]
+    assert "Вот как я пишу сам" in sent[0]["content"]
+
+
+def test_analyze_without_a_style_block_uses_the_cached_prompt():
+    s = _make_suggester_with_reply("Разбор.\n1) А")
+    s.analyze([{"from_me": False, "text": "хай"}])
+    sent = s._client.chat.completions.create.call_args.kwargs["messages"]
+    assert sent[0]["content"] == "системный промпт"
+
+
+def test_empty_about_keeps_the_prompt_unchanged():
+    # Регрессия: без профиля промпт обязан остаться ровно прежним
+    assert (build_system_prompt(["дерзкий"], "стиль", "", "")
+            == build_system_prompt(["дерзкий"], "стиль"))
+
+
+def test_about_goes_into_the_prompt_as_a_block():
+    prompt = build_system_prompt(["дерзкий"], "стиль",
+                                 about="Зовут Даниил, 23, Томск.")
+    assert "Обо мне:" in prompt
+    assert "Зовут Даниил, 23, Томск." in prompt
+
+
+def test_about_replaces_the_blanket_ban_on_inventing_facts():
+    # Без профиля выдумывать нельзя ничего; с профилем запрет становится
+    # исключением, иначе две инструкции противоречат друг другу
+    plain = build_system_prompt(["дерзкий"], "стиль")
+    assert "Не выдумывай фактов обо мне и о собеседнике" in plain
+    with_about = build_system_prompt(["дерзкий"], "стиль", about="Даниил.")
+    assert "Не выдумывай фактов обо мне и о собеседнике" not in with_about
+
+
+def test_about_allows_small_details_and_forbids_big_ones():
+    prompt = build_system_prompt(["дерзкий"], "стиль", about="Даниил.")
+    assert "противоречить ему нельзя" in prompt
+    assert "бытового масштаба, одну на сообщение" in prompt
+    assert "Про собеседника не выдумывай ничего" in prompt
+
+
+def test_about_asks_to_lean_on_shared_interests():
+    prompt = build_system_prompt(["дерзкий"], "стиль", about="Даниил.")
+    assert "цепляйся за пересечение" in prompt
+    assert "выдуманного совпадения" in prompt
+
+
+def test_about_does_not_override_the_flirt_ceiling_or_the_format():
+    prompt = build_system_prompt(["дерзкий"], "стиль", about="Даниил.")
+    assert "пошлый подтекст — нет" in prompt
+    assert "'1) текст'" in prompt
+
+
+def test_analyze_keeps_about_when_the_style_block_rebuilds_the_prompt():
+    # Промпт пересобирается ради выученной манеры — профиль при этом теряться
+    # не должен
+    s = _make_suggester_with_reply("Разбор.\n1) А")
+    s._tones = ["дерзкий"]
+    s._style = "стиль"
+    s._about = "Зовут Даниил, 23, Томск."
+    s.analyze([{"from_me": False, "text": "хай"}],
+              style_block="Вот как я пишу сам:\n- «норм»")
+    sent = s._client.chat.completions.create.call_args.kwargs["messages"]
+    assert "Зовут Даниил, 23, Томск." in sent[0]["content"]
+    assert "Вот как я пишу сам" in sent[0]["content"]
+
+
+def test_suggester_puts_about_into_the_cached_prompt():
+    s = Suggester(api_key="k", tones=["дерзкий"], style="стиль",
+                  about="Зовут Даниил, 23, Томск.")
+    assert "Зовут Даниил, 23, Томск." in s._system_prompt
+
+
+def test_prompt_explains_media_markers():
+    prompt = build_system_prompt(["дерзкий"], "стиль")
+    assert "[голосовое" in prompt
+    assert "[фото]" in prompt
+
+
+def test_prompt_forbids_guessing_what_an_untranscribed_voice_said():
+    # Иначе модель уверенно отвечает на содержимое, которого никто не слышал
+    prompt = build_system_prompt(["дерзкий"], "стиль")
+    assert "не расшифровано" in prompt
+    assert "не делай вид, что знаешь" in prompt
