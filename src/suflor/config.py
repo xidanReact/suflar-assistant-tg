@@ -1,4 +1,5 @@
 from dataclasses import dataclass, field, fields
+from pathlib import Path
 import yaml
 
 DEFAULT_MODEL = "deepseek-v4-pro"
@@ -43,6 +44,25 @@ class Config:
     ignore_usernames: list[str] = field(default_factory=list)
     ignore_user_ids: list[int] = field(default_factory=list)
     learning: Learning = field(default_factory=Learning)
+    # Факты обо мне — текст файла about_file, уже прочитанный. Пустая строка,
+    # пока профиля нет: промпт тогда обязан остаться прежним.
+    about: str = ""
+
+
+def _load_about(path: str, name: str | None) -> str:
+    """Профиль из отдельного файла: длинный текст в YAML править неудобно.
+
+    Путь считается от config.yaml, а не от рабочей директории: бота запускают
+    из разных мест, и относительный путь иначе то находится, то нет. Файла
+    нет — падаем на старте: молча отвечать «за меня» без фактов хуже, чем
+    отказаться запускаться.
+    """
+    if not name:
+        return ""
+    file = Path(path).resolve().parent / name
+    if not file.is_file():
+        raise FileNotFoundError(f"не найден файл профиля: {file}")
+    return file.read_text(encoding="utf-8").strip()
 
 
 def _load_learning(data: dict) -> Learning:
@@ -66,4 +86,5 @@ def load_config(path: str) -> Config:
         model=data.get("model") or DEFAULT_MODEL,
         ignore_usernames=data.get("ignore_usernames", []),
         ignore_user_ids=data.get("ignore_user_ids", []),
+        about=_load_about(path, data.get("about_file")),
     )

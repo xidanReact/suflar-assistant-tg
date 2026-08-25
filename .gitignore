@@ -9,3 +9,6 @@ __pycache__/
 *.db
 *.db-journal
 *.egg-info/
+
+# Профиль: личные данные, в репозиторий не идёт
+about.md

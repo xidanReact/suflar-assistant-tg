@@ -345,7 +345,7 @@ async def _amain():
     cfg = load_config(CONFIG_PATH)
     suggester = Suggester(api_key=deepseek_key, tones=cfg.tones,
                           style=cfg.style, temperature=cfg.temperature,
-                          model=cfg.model)
+                          model=cfg.model, about=cfg.about)
 
     conn = store.open_store(DB_PATH)
     # Диалоги, заглохшие ещё до перезапуска, ответа уже не дождутся

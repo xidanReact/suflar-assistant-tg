@@ -1,3 +1,5 @@
+import pytest
+
 from suflor.config import (
     load_config, Config, DEFAULT_TONES, DEFAULT_STYLE, DEFAULT_MODEL,
 )
@@ -69,6 +71,35 @@ def test_load_config_applies_defaults(tmp_path):
     assert cfg.model == DEFAULT_MODEL
     assert cfg.ignore_usernames == []
     assert cfg.ignore_user_ids == []
+
+
+def test_reads_about_from_the_file_next_to_the_config(tmp_path):
+    (tmp_path / "about.md").write_text("Зовут Даниил, 23.\n", encoding="utf-8")
+    path = _write(tmp_path, "panel_chat: me\nabout_file: about.md\n")
+    assert load_config(path).about == "Зовут Даниил, 23."
+
+
+def test_about_file_is_relative_to_the_config_not_the_cwd(tmp_path,
+                                                          monkeypatch):
+    # Бот запускают из разных мест; путь должен считаться от config.yaml
+    (tmp_path / "about.md").write_text("Зовут Даниил.", encoding="utf-8")
+    path = _write(tmp_path, "panel_chat: me\nabout_file: about.md\n")
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)
+    assert load_config(path).about == "Зовут Даниил."
+
+
+def test_about_is_empty_when_the_field_is_absent(tmp_path):
+    # Конфиг, написанный до профиля, должен работать по-прежнему
+    assert load_config(_write(tmp_path, "panel_chat: me\n")).about == ""
+
+
+def test_missing_about_file_raises_with_the_path(tmp_path):
+    # Молча работать без профиля хуже, чем упасть на старте с внятной причиной
+    path = _write(tmp_path, "panel_chat: me\nabout_file: about.md\n")
+    with pytest.raises(FileNotFoundError, match="about.md"):
+        load_config(path)
 
 
 def test_learning_defaults_when_section_is_absent(tmp_path):
