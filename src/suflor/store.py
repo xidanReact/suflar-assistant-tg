@@ -45,6 +45,14 @@ CREATE TABLE IF NOT EXISTS outcomes (
     score REAL NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS transcripts (
+    chat_id INTEGER NOT NULL,
+    msg_id INTEGER NOT NULL,
+    text TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (chat_id, msg_id)
+);
+
 CREATE INDEX IF NOT EXISTS idx_sent_chat ON sent(chat_id, sent_at);
 CREATE INDEX IF NOT EXISTS idx_suggestions_chat
     ON suggestions(chat_id, created_at);
@@ -242,7 +250,32 @@ def forget_chat(conn, chat_id: int) -> None:
         "(SELECT id FROM sent WHERE chat_id = ?)", (chat_id,))
     conn.execute("DELETE FROM sent WHERE chat_id = ?", (chat_id,))
     conn.execute("DELETE FROM suggestions WHERE chat_id = ?", (chat_id,))
+    conn.execute("DELETE FROM transcripts WHERE chat_id = ?", (chat_id,))
     conn.commit()
+
+
+def save_transcript(conn, chat_id: int, msg_id: int, text: str,
+                    created_at: datetime | None = None) -> None:
+    """Запомнить расшифровку голосового.
+
+    Кеш обязателен, а не удобен: историю перечитывают на каждое входящее, и
+    без него одно голосовое расшифровывалось бы снова и снова, пока не
+    кончится пробная квота.
+    """
+    conn.execute(
+        "INSERT INTO transcripts (chat_id, msg_id, text, created_at) "
+        "VALUES (?, ?, ?, ?) ON CONFLICT(chat_id, msg_id) DO UPDATE SET "
+        "text = excluded.text, created_at = excluded.created_at",
+        (chat_id, msg_id, text,
+         _iso(created_at or datetime.now(timezone.utc))))
+    conn.commit()
+
+
+def transcripts(conn, chat_id: int) -> dict[int, str]:
+    """Все расшифровки диалога разом: id сообщения -> текст."""
+    rows = conn.execute(
+        "SELECT msg_id, text FROM transcripts WHERE chat_id = ?", (chat_id,))
+    return {r["msg_id"]: r["text"] for r in rows}
 
 
 def learning_summary(conn) -> dict:

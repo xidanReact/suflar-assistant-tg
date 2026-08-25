@@ -416,3 +416,16 @@ def test_suggester_puts_about_into_the_cached_prompt():
     s = Suggester(api_key="k", tones=["дерзкий"], style="стиль",
                   about="Зовут Даниил, 23, Томск.")
     assert "Зовут Даниил, 23, Томск." in s._system_prompt
+
+
+def test_prompt_explains_media_markers():
+    prompt = build_system_prompt(["дерзкий"], "стиль")
+    assert "[голосовое" in prompt
+    assert "[фото]" in prompt
+
+
+def test_prompt_forbids_guessing_what_an_untranscribed_voice_said():
+    # Иначе модель уверенно отвечает на содержимое, которого никто не слышал
+    prompt = build_system_prompt(["дерзкий"], "стиль")
+    assert "не расшифровано" in prompt
+    assert "не делай вид, что знаешь" in prompt

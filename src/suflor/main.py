@@ -13,7 +13,7 @@ from suflor.chat_filter import should_suggest, IncomingContext
 from suflor.suggester import Suggester, SuggesterError
 from suflor.matching import classify_sent
 from suflor.outcome import reply_stats, score_reply, has_question
-from suflor import store, profile
+from suflor import store, profile, media
 from suflor.control_panel import (
     format_suggestions, format_error, format_stats, build_chat_link,
     utf16_span,
@@ -30,22 +30,54 @@ DB_PATH = os.getenv("SUFLOR_DB", "suflor.db")
 STATE = {"enabled": True, "learning": True}
 
 
-async def _collect_history(client, chat_id, limit):
+async def _collect_history(client, chat_id, limit, transcripts=None):
     """История диалога и признак того, что она целиком, а не обрезана лимитом.
 
     Упёрлись в лимит — начала переписки не видно, и говорить, кто написал
     первым, нельзя: первым в выборке окажется случайный человек.
+
+    Медиа получает пометку вместо пустой строки, а голосовое — расшифровку из
+    `transcripts`, если она там есть. В Telegram отсюда не ходим ни за чем:
+    историю перечитывают на каждое входящее, и запрос расшифровки на каждое
+    голосовое в ней выел бы пробную квоту за пару сообщений.
     """
+    transcripts = transcripts or {}
     history = []
     seen = 0
     async for msg in client.iter_messages(chat_id, limit=limit):
         seen += 1
-        if not msg.text:
+        text = media.describe(msg, transcripts.get(msg.id)) or msg.text
+        if not text:
             continue
-        history.append({"from_me": bool(msg.out), "text": msg.text,
+        history.append({"from_me": bool(msg.out), "text": text,
                         "date": msg.date})
     history.reverse()  # от старых к новым
     return history, seen < limit
+
+
+async def resolve_incoming_text(conn, transcriber, chat_id: int, peer,
+                                msg) -> str:
+    """Текст входящего сообщения — тот, на который бот будет отвечать.
+
+    Обычный текст возвращается как есть. Медиа получает пометку. Голосовое —
+    единственное, ради чего мы ходим в Telegram, и ровно один раз: сперва
+    смотрим кеш, а добытую расшифровку сразу в него кладём. Кеш не
+    оптимизация, а условие работы: без него пробная квота кончится за день.
+    """
+    marker = media.describe(msg)
+    if not marker:
+        return msg.text or ""
+    if not msg.voice:
+        return marker
+
+    cached = store.transcripts(conn, chat_id).get(msg.id) if conn else None
+    if cached:
+        return media.describe(msg, cached)
+
+    text = await transcriber.transcribe(peer, msg) if transcriber else None
+    if text and conn is not None:
+        store.save_transcript(conn, chat_id, msg.id, text)
+    return media.describe(msg, text)
 
 
 def record_outgoing(conn, chat_id: int, text: str, sent_at: datetime,
@@ -308,14 +340,18 @@ async def _handle_hint(client, cfg, suggester, event, arg: str, conn=None):
         return
 
     name = utils.get_display_name(entity) or str(target)
-    history, full = await _collect_history(client, entity, cfg.context_messages)
+    chat_id = utils.get_peer_id(entity)
+    # Расшифровки берём только из кеша: /hint можно звать сколько угодно, а
+    # пробная квота на расшифровку одна на неделю
+    cached = store.transcripts(conn, chat_id) if conn is not None else None
+    history, full = await _collect_history(client, entity,
+                                           cfg.context_messages, cached)
     if not history:
         await client.send_message(
             cfg.panel_chat, f"В диалоге с {name} нет текстовых сообщений.",
             parse_mode=None)
         return
 
-    chat_id = utils.get_peer_id(entity)
     learned = _learned_style(conn, cfg, chat_id)
     try:
         analysis, variants = await asyncio.to_thread(suggester.analyze,
@@ -346,6 +382,14 @@ async def _amain():
     suggester = Suggester(api_key=deepseek_key, tones=cfg.tones,
                           style=cfg.style, temperature=cfg.temperature,
                           model=cfg.model, about=cfg.about)
+
+    transcriber = media.Transcriber(client)
+
+    @client.on(events.Raw(types.UpdateTranscribedAudio))
+    async def _on_transcribed(update):
+        """Досланная расшифровка: Telegram отвечает на запрос пустым pending,
+        а текст присылает отдельным апдейтом."""
+        transcriber.on_update(update)
 
     conn = store.open_store(DB_PATH)
     # Диалоги, заглохшие ещё до перезапуска, ответа уже не дождутся
@@ -424,11 +468,19 @@ async def _amain():
         except errors.RPCError:
             pass
 
-        history, full = await _collect_history(client, event.chat_id,
-                                               cfg.context_messages)
+        # Голосовое расшифровываем здесь и только здесь — один запрос на
+        # одно новое сообщение. Дальше везде идёт уже разрешённый текст:
+        # event.raw_text у голосового пустой, и бот отвечал бы на пустоту.
+        incoming = await resolve_incoming_text(
+            conn, transcriber, event.chat_id,
+            await event.get_input_chat(), event.message)
+
+        history, full = await _collect_history(
+            client, event.chat_id, cfg.context_messages,
+            store.transcripts(conn, event.chat_id))
         # Её ответ закрывает исходы моих предыдущих сообщений в этом чате
         if STATE["learning"]:
-            resolve_outcomes(conn, event.chat_id, history, event.raw_text,
+            resolve_outcomes(conn, event.chat_id, history, incoming,
                              event.date, cfg.learning.outcome_window_hours)
 
         learned = _learned_style(conn, cfg, event.chat_id)
@@ -443,11 +495,11 @@ async def _amain():
 
         if STATE["learning"]:
             store.save_suggestion(conn, event.chat_id, cfg.tones, variants,
-                                  event.raw_text)
+                                  incoming)
 
         text, entities = await _build_panel_message(
             client, sender_name, ctx.sender_username, ctx.sender_id,
-            event.raw_text, variants, analysis, cfg.tones)
+            incoming, variants, analysis, cfg.tones)
         await client.send_message(cfg.panel_chat, text,
                                   formatting_entities=entities,
                                   parse_mode=None)

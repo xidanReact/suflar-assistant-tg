@@ -4,6 +4,7 @@ from suflor.store import (
     open_store, save_suggestion, last_suggestion, save_sent, sent_exists,
     save_outcome, pending_outcomes, expire_pending, style_samples, tone_stats,
     suggestion_count, edited_pairs, forget_chat, learning_summary,
+    save_transcript, transcripts,
 )
 
 NOW = datetime(2026, 8, 24, 12, tzinfo=timezone.utc)
@@ -233,3 +234,33 @@ def test_learning_summary_reports_what_was_collected(tmp_path):
     assert summary["chats"] == 2
     assert summary["suggestions"] == 1
     assert summary["tones"] == {"игривый": 1}
+
+
+def test_transcripts_are_read_back_by_chat(tmp_path):
+    conn = _store(tmp_path)
+    save_transcript(conn, 1, 10, "привет как ты", NOW)
+    save_transcript(conn, 1, 11, "второе", NOW)
+    save_transcript(conn, 2, 10, "чужое", NOW)
+    assert transcripts(conn, 1) == {10: "привет как ты", 11: "второе"}
+
+
+def test_transcripts_are_empty_for_an_untouched_chat(tmp_path):
+    assert transcripts(_store(tmp_path), 1) == {}
+
+
+def test_saving_the_same_message_twice_does_not_duplicate(tmp_path):
+    # Одно голосовое расшифровывается один раз, но повтор не должен падать
+    conn = _store(tmp_path)
+    save_transcript(conn, 1, 10, "первый", NOW)
+    save_transcript(conn, 1, 10, "уточнённый", NOW)
+    assert transcripts(conn, 1) == {10: "уточнённый"}
+
+
+def test_forget_chat_wipes_transcripts_too(tmp_path):
+    # Иначе /forget оставит в базе её голос, а README про приватность соврёт
+    conn = _store(tmp_path)
+    save_transcript(conn, 1, 10, "её голос", NOW)
+    save_transcript(conn, 2, 10, "чужой", NOW)
+    forget_chat(conn, 1)
+    assert transcripts(conn, 1) == {}
+    assert transcripts(conn, 2) == {10: "чужой"}

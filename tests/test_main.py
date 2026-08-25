@@ -2,10 +2,14 @@ from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 from suflor.main import (
+    resolve_incoming_text,
     _ask_password, _collect_history, record_outgoing, resolve_outcomes,
     harvest_chat, _is_harvestable,
 )
-from suflor.store import open_store, save_suggestion, style_samples, tone_stats
+from suflor.store import (
+    open_store, save_suggestion, style_samples, tone_stats,
+    save_transcript, transcripts,
+)
 
 
 def _prompts(*values):
@@ -28,12 +32,26 @@ def test_keeps_password_verbatim():
     assert _ask_password(_prompts(" hunter2 ")) == " hunter2 "
 
 
-def _tg_message(text, out=False):
-    return SimpleNamespace(text=text, out=out, date=None)
+_MEDIA_KINDS = ("voice", "video_note", "sticker", "gif", "photo", "video",
+                "audio", "contact", "geo", "poll", "document")
+
+
+def _tg_message(text, out=False, kind=None, duration=None, msg_id=1):
+    m = SimpleNamespace(id=msg_id, text=text, out=out, date=None,
+                        **{k: None for k in _MEDIA_KINDS})
+    if kind:
+        setattr(m, kind, object())
+    m.file = SimpleNamespace(duration=duration, emoji=None) if duration else None
+    return m
 
 
 class _FakeClient:
-    """Telethon отдаёт сообщения от новых к старым и режет выборку лимитом."""
+    """Telethon отдаёт сообщения от новых к старым и режет выборку лимитом.
+
+    Любой вызов самого клиента — запрос к Telegram. Здесь он падает: сбор
+    истории обязан обходиться без сетевых запросов, иначе пробную квоту на
+    расшифровку сожжёт первый же диалог.
+    """
 
     def __init__(self, messages):
         self._messages = messages
@@ -43,6 +61,9 @@ class _FakeClient:
             for m in self._messages[:limit]:
                 yield m
         return gen()
+
+    async def __call__(self, request):
+        raise AssertionError(f"сбор истории полез в Telegram: {request!r}")
 
 
 async def test_collect_history_orders_from_old_to_new():
@@ -65,14 +86,44 @@ async def test_collect_history_reports_truncation_at_the_limit():
     assert full is False
 
 
-async def test_collect_history_counts_skipped_media_towards_the_limit():
-    # Фото без подписи в историю не попадает, но лимит израсходовало —
-    # значит, до начала переписки мы всё равно не дочитали.
+async def test_collect_history_counts_unusable_messages_towards_the_limit():
+    # Сообщение без текста и без распознаваемого медиа в историю не попадает,
+    # но лимит израсходовало — значит, до начала переписки мы не дочитали.
     client = _FakeClient([_tg_message("привет"), _tg_message(None),
                           _tg_message("хай")])
     history, full = await _collect_history(client, 1, limit=3)
     assert [m["text"] for m in history] == ["хай", "привет"]
     assert full is False
+
+
+async def test_collect_history_marks_a_voice_without_a_transcript():
+    # Пустая строка на месте голосового заставляла модель отвечать на пустоту
+    client = _FakeClient([_tg_message(None, kind="voice", duration=12)])
+    history, _ = await _collect_history(client, 1, limit=10)
+    assert [m["text"] for m in history] == ["[голосовое 12 сек, не расшифровано]"]
+
+
+async def test_collect_history_substitutes_a_cached_transcript():
+    client = _FakeClient([_tg_message(None, kind="voice", duration=12,
+                                      msg_id=42)])
+    history, _ = await _collect_history(client, 1, limit=10,
+                                        transcripts={42: "привет, как ты"})
+    assert [m["text"] for m in history] == ["[голосовое 12 сек] привет, как ты"]
+
+
+async def test_collect_history_keeps_a_photo_caption():
+    client = _FakeClient([_tg_message("я на море", kind="photo")])
+    history, _ = await _collect_history(client, 1, limit=10)
+    assert [m["text"] for m in history] == ["[фото] я на море"]
+
+
+async def test_collect_history_never_calls_telegram_for_transcripts():
+    # Регрессия на квоту: историю перечитывают на каждое входящее, и запрос
+    # расшифровки отсюда выел бы её за пару сообщений
+    client = _FakeClient([_tg_message(None, kind="voice", duration=5, msg_id=i)
+                          for i in range(5)])
+    history, _ = await _collect_history(client, 1, limit=10)
+    assert len(history) == 5
 
 
 NOW = datetime(2026, 8, 24, 12, tzinfo=timezone.utc)
@@ -263,3 +314,64 @@ def test_harvestable_respects_the_ignore_list():
 
 def test_harvestable_handles_a_person_without_username():
     assert _is_harvestable(_dialog(username=None), _train_cfg()) is True
+
+
+class _FakeTranscriber:
+    def __init__(self, result=None):
+        self.result = result
+        self.calls = 0
+
+    async def transcribe(self, peer, msg):
+        self.calls += 1
+        return self.result
+
+
+async def test_resolve_returns_plain_text_as_is(tmp_path):
+    tr = _FakeTranscriber("не должно понадобиться")
+    got = await resolve_incoming_text(_conn(tmp_path), tr, 1, "peer",
+                                      _tg_message("привет"))
+    assert got == "привет"
+    assert tr.calls == 0
+
+
+async def test_resolve_transcribes_a_voice_and_caches_it(tmp_path):
+    conn = _conn(tmp_path)
+    tr = _FakeTranscriber("привет, как ты")
+    msg = _tg_message(None, kind="voice", duration=12, msg_id=42)
+    got = await resolve_incoming_text(conn, tr, 1, "peer", msg)
+    assert got == "[голосовое 12 сек] привет, как ты"
+    assert transcripts(conn, 1) == {42: "привет, как ты"}
+
+
+async def test_resolve_falls_back_to_the_marker_when_transcription_fails(tmp_path):
+    conn = _conn(tmp_path)
+    msg = _tg_message(None, kind="voice", duration=12, msg_id=42)
+    got = await resolve_incoming_text(conn, _FakeTranscriber(None), 1, "peer", msg)
+    assert got == "[голосовое 12 сек, не расшифровано]"
+    assert transcripts(conn, 1) == {}
+
+
+async def test_resolve_uses_the_cache_instead_of_the_quota(tmp_path):
+    conn = _conn(tmp_path)
+    save_transcript(conn, 1, 42, "уже расшифровано", NOW)
+    tr = _FakeTranscriber("новое")
+    msg = _tg_message(None, kind="voice", duration=12, msg_id=42)
+    got = await resolve_incoming_text(conn, tr, 1, "peer", msg)
+    assert got == "[голосовое 12 сек] уже расшифровано"
+    assert tr.calls == 0
+
+
+async def test_resolve_does_not_transcribe_a_photo(tmp_path):
+    tr = _FakeTranscriber("не должно понадобиться")
+    msg = _tg_message("я на море", kind="photo")
+    got = await resolve_incoming_text(_conn(tmp_path), tr, 1, "peer", msg)
+    assert got == "[фото] я на море"
+    assert tr.calls == 0
+
+
+async def test_resolve_works_without_a_store():
+    # conn=None бывает, когда самообучение выключено совсем
+    msg = _tg_message(None, kind="voice", duration=12, msg_id=42)
+    got = await resolve_incoming_text(None, _FakeTranscriber("слышно"), 1,
+                                      "peer", msg)
+    assert got == "[голосовое 12 сек] слышно"
