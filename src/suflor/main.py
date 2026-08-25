@@ -452,15 +452,6 @@ async def _amain():
                           style=cfg.style, temperature=cfg.temperature,
                           model=cfg.model, about=cfg.about)
 
-    transcriber = media.Transcriber(client)
-    debouncer = Debouncer(cfg.debounce_seconds)
-
-    @client.on(events.Raw(types.UpdateTranscribedAudio))
-    async def _on_transcribed(update):
-        """Досланная расшифровка: Telegram отвечает на запрос пустым pending,
-        а текст присылает отдельным апдейтом."""
-        transcriber.on_update(update)
-
     conn = store.open_store(DB_PATH)
     # Диалоги, заглохшие ещё до перезапуска, ответа уже не дождутся
     STATE["learning"] = cfg.learning.enabled
@@ -472,6 +463,15 @@ async def _amain():
     print("Суфлёр запущен. Первый вход — введи код из Telegram "
           "(и облачный пароль, если включена 2FA).")
     await client.start(password=_ask_password)
+
+    transcriber = media.Transcriber(client)
+    debouncer = Debouncer(cfg.debounce_seconds)
+
+    @client.on(events.Raw(types.UpdateTranscribedAudio))
+    async def _on_transcribed(update):
+        """Досланная расшифровка: Telegram отвечает на запрос пустым pending,
+        а текст присылает отдельным апдейтом."""
+        transcriber.on_update(update)
 
     # id пульта нужен, чтобы /on /off не срабатывали в живых переписках
     panel_id = utils.get_peer_id(await client.get_entity(cfg.panel_chat))
