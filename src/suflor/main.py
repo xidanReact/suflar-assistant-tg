@@ -600,12 +600,13 @@ async def _amain():
     watched = len(store.watched_chats(conn))
     if cfg.watch_mode == "selected":
         # Пустой список — молчащий бот, и по логам это не отличить от поломки
-        scope = (f"слежу за {watched} "
+        scope = (f"Слежу за {watched} "
                  f"{plural(watched, 'диалогом', 'диалогами', 'диалогами')}"
                  if watched else
-                 "список наблюдения ПУСТ — суфлёр молчит везде, /watch @username")
+                 "Список наблюдения ПУСТ: суфлёр молчит везде, отметь диалог "
+                 "командой /watch @username")
     else:
-        scope = "реагирую на всех подряд (watch_mode: all)"
+        scope = "Реагирую на всех подряд (watch_mode: all)"
     pause = (f", склейка серий: {cfg.debounce_seconds:g} с"
              if cfg.debounce_seconds else "")
     print(f"Готово. Подсказки идут в: {cfg.panel_chat}. {scope}{pause}. "
