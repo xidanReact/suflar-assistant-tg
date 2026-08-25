@@ -10,7 +10,8 @@ from telethon.tl import types
 
 from suflor.config import load_config
 from suflor.chat_filter import should_suggest, IncomingContext
-from suflor.suggester import Suggester, SuggesterError, plural
+from suflor.dialog import plural
+from suflor.suggester import Suggester, SuggesterError
 from suflor.matching import classify_sent
 from suflor.outcome import reply_stats, score_reply, has_question
 from suflor import store, profile, media
