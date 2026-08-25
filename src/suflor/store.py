@@ -53,6 +53,12 @@ CREATE TABLE IF NOT EXISTS transcripts (
     PRIMARY KEY (chat_id, msg_id)
 );
 
+CREATE TABLE IF NOT EXISTS watched (
+    chat_id INTEGER PRIMARY KEY,
+    username TEXT,
+    added_at TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_sent_chat ON sent(chat_id, sent_at);
 CREATE INDEX IF NOT EXISTS idx_suggestions_chat
     ON suggestions(chat_id, created_at);
@@ -251,6 +257,7 @@ def forget_chat(conn, chat_id: int) -> None:
     conn.execute("DELETE FROM sent WHERE chat_id = ?", (chat_id,))
     conn.execute("DELETE FROM suggestions WHERE chat_id = ?", (chat_id,))
     conn.execute("DELETE FROM transcripts WHERE chat_id = ?", (chat_id,))
+    conn.execute("DELETE FROM watched WHERE chat_id = ?", (chat_id,))
     conn.commit()
 
 
@@ -276,6 +283,36 @@ def transcripts(conn, chat_id: int) -> dict[int, str]:
     rows = conn.execute(
         "SELECT msg_id, text FROM transcripts WHERE chat_id = ?", (chat_id,))
     return {r["msg_id"]: r["text"] for r in rows}
+
+
+def watch(conn, chat_id: int, username: str | None,
+          added_at: datetime | None = None) -> None:
+    """Взять диалог под наблюдение. Повтор просто освежает username."""
+    conn.execute(
+        "INSERT INTO watched (chat_id, username, added_at) VALUES (?, ?, ?) "
+        "ON CONFLICT(chat_id) DO UPDATE SET username = excluded.username",
+        (chat_id, username, _iso(added_at or datetime.now(timezone.utc))))
+    conn.commit()
+
+
+def unwatch(conn, chat_id: int) -> bool:
+    """Снять наблюдение. False — его и не было, есть о чём сказать в пульт."""
+    removed = conn.execute("DELETE FROM watched WHERE chat_id = ?",
+                           (chat_id,)).rowcount
+    conn.commit()
+    return bool(removed)
+
+
+def watched_chats(conn) -> list:
+    """Весь список, в порядке добавления."""
+    return conn.execute(
+        "SELECT chat_id, username, added_at FROM watched ORDER BY added_at, "
+        "chat_id").fetchall()
+
+
+def is_watched(conn, chat_id: int) -> bool:
+    return conn.execute("SELECT 1 FROM watched WHERE chat_id = ?",
+                        (chat_id,)).fetchone() is not None
 
 
 def learning_summary(conn) -> dict:

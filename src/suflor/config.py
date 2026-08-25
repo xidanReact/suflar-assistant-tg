@@ -3,6 +3,12 @@ from pathlib import Path
 import yaml
 
 DEFAULT_MODEL = "deepseek-v4-pro"
+
+# Реагировать на всех подряд или только на отмеченные /watch диалоги.
+# По умолчанию all: конфиг, написанный до списка наблюдения, не должен
+# внезапно замолчать.
+WATCH_MODES = ("all", "selected")
+DEFAULT_WATCH_MODE = "all"
 DEFAULT_TONES = [
     "игривый, с лёгким флиртом",
     "тёплый, искренний",
@@ -44,6 +50,10 @@ class Config:
     ignore_usernames: list[str] = field(default_factory=list)
     ignore_user_ids: list[int] = field(default_factory=list)
     learning: Learning = field(default_factory=Learning)
+    watch_mode: str = DEFAULT_WATCH_MODE
+    # Сколько ждать тишины, прежде чем разбирать диалог. Серия реплик подряд
+    # превращается в один запрос вместо пяти. 0 — отвечать сразу.
+    debounce_seconds: float = 0.0
     # Факты обо мне — текст файла about_file, уже прочитанный. Пустая строка,
     # пока профиля нет: промпт тогда обязан остаться прежним.
     about: str = ""
@@ -63,6 +73,17 @@ def _load_about(path: str, name: str | None) -> str:
     if not file.is_file():
         raise FileNotFoundError(f"не найден файл профиля: {file}")
     return file.read_text(encoding="utf-8").strip()
+
+
+def _watch_mode(value: str | None) -> str:
+    """Опечатка в режиме — это молчащий бот, поэтому падаем сразу и внятно."""
+    if not value:
+        return DEFAULT_WATCH_MODE
+    if value not in WATCH_MODES:
+        raise ValueError(
+            f"watch_mode: ожидалось одно из {', '.join(WATCH_MODES)}, "
+            f"а не «{value}»")
+    return value
 
 
 def _load_learning(data: dict) -> Learning:
@@ -87,4 +108,6 @@ def load_config(path: str) -> Config:
         ignore_usernames=data.get("ignore_usernames", []),
         ignore_user_ids=data.get("ignore_user_ids", []),
         about=_load_about(path, data.get("about_file")),
+        watch_mode=_watch_mode(data.get("watch_mode")),
+        debounce_seconds=float(data.get("debounce_seconds", 0)),
     )

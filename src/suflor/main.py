@@ -10,13 +10,14 @@ from telethon.tl import types
 
 from suflor.config import load_config
 from suflor.chat_filter import should_suggest, IncomingContext
-from suflor.suggester import Suggester, SuggesterError
+from suflor.suggester import Suggester, SuggesterError, plural
 from suflor.matching import classify_sent
 from suflor.outcome import reply_stats, score_reply, has_question
 from suflor import store, profile, media
+from suflor.debounce import Debouncer
 from suflor.control_panel import (
     format_suggestions, format_error, format_stats, build_chat_link,
-    utf16_span,
+    utf16_span, format_watchlist,
 )
 
 load_dotenv()
@@ -28,6 +29,10 @@ DB_PATH = os.getenv("SUFLOR_DB", "suflor.db")
 # самообучения (/learn on|off). Оба сбрасываются к значениям конфига при
 # перезапуске.
 STATE = {"enabled": True, "learning": True}
+
+# Начало текущей серии реплик по диалогу: chat_id -> (текст, время).
+# Нужно, чтобы склейка не портила замер скорости ответа.
+BURSTS: dict[int, tuple[str, object]] = {}
 
 
 async def _collect_history(client, chat_id, limit, transcripts=None):
@@ -248,6 +253,70 @@ async def _handle_forget(client, conn, cfg, arg: str):
         parse_mode=None)
 
 
+async def _resolve_target(client, cfg, arg: str, usage: str):
+    """Диалог по аргументу команды. None — уже отписались в пульт, почему."""
+    target = parse_hint_target(arg) if arg else None
+    if target is None:
+        await client.send_message(cfg.panel_chat, usage, parse_mode=None)
+        return None
+    try:
+        return await client.get_entity(target)
+    except (ValueError, TypeError, errors.RPCError):
+        await client.send_message(cfg.panel_chat, f"Не нашёл диалог: {arg}",
+                                  parse_mode=None)
+        return None
+
+
+async def _handle_watch(client, conn, cfg, arg: str):
+    """Взять диалог под наблюдение, а без аргумента — показать список."""
+    if not arg:
+        people = []
+        for row in store.watched_chats(conn):
+            try:
+                entity = await client.get_entity(row["chat_id"])
+                name = utils.get_display_name(entity)
+            except (ValueError, TypeError, errors.RPCError):
+                name = None
+            people.append({"name": name, "username": row["username"]})
+        await client.send_message(
+            cfg.panel_chat, format_watchlist(people, cfg.watch_mode),
+            parse_mode=None)
+        return
+
+    entity = await _resolve_target(
+        client, cfg, arg, "За кем следить? «/watch @username».")
+    if entity is None:
+        return
+
+    name = utils.get_display_name(entity) or str(arg)
+    store.watch(conn, utils.get_peer_id(entity),
+                getattr(entity, "username", None))
+    total = len(store.watched_chats(conn))
+    note = ("" if cfg.watch_mode == "selected"
+            else " Но watch_mode: all — суфлёр и так реагирует на всех.")
+    await client.send_message(
+        cfg.panel_chat, f"Слежу за {name}. Всего в списке: {total}.{note}",
+        parse_mode=None)
+
+
+async def _handle_unwatch(client, conn, cfg, arg: str):
+    """Снять диалог с наблюдения."""
+    entity = await _resolve_target(
+        client, cfg, arg, "Кого снять? «/unwatch @username».")
+    if entity is None:
+        return
+
+    name = utils.get_display_name(entity) or str(arg)
+    if not store.unwatch(conn, utils.get_peer_id(entity)):
+        await client.send_message(
+            cfg.panel_chat, f"За {name} я и не следил.", parse_mode=None)
+        return
+    total = len(store.watched_chats(conn))
+    await client.send_message(
+        cfg.panel_chat, f"Больше не слежу за {name}. Осталось: {total}.",
+        parse_mode=None)
+
+
 async def harvest_chat(client, conn, entity, chat_id: int, limit: int) -> int:
     """Собрать мои сообщения из истории одного диалога. Возвращает число новых.
 
@@ -384,6 +453,7 @@ async def _amain():
                           model=cfg.model, about=cfg.about)
 
     transcriber = media.Transcriber(client)
+    debouncer = Debouncer(cfg.debounce_seconds)
 
     @client.on(events.Raw(types.UpdateTranscribedAudio))
     async def _on_transcribed(update):
@@ -439,6 +509,14 @@ async def _amain():
                     cfg.panel_chat, f"Корпус самообучения {state}.",
                     parse_mode=None)
                 return
+            if cmd == "/watch" or cmd.startswith("/watch "):
+                await _handle_watch(client, conn, cfg,
+                                    cmd[len("/watch"):].strip())
+                return
+            if cmd == "/unwatch" or cmd.startswith("/unwatch "):
+                await _handle_unwatch(client, conn, cfg,
+                                      cmd[len("/unwatch"):].strip())
+                return
             if cmd == "/forget" or cmd.startswith("/forget "):
                 await _handle_forget(client, conn, cfg,
                                      cmd[len("/forget"):].strip())
@@ -456,7 +534,8 @@ async def _amain():
 
         sender = await event.get_sender()
         ctx = _build_ctx(event, sender)
-        if not should_suggest(ctx, cfg, STATE["enabled"]):
+        if not should_suggest(ctx, cfg, STATE["enabled"],
+                              store.is_watched(conn, event.chat_id)):
             return
 
         sender_name = getattr(sender, "first_name", None) or str(ctx.sender_id)
@@ -475,38 +554,63 @@ async def _amain():
             conn, transcriber, event.chat_id,
             await event.get_input_chat(), event.message)
 
-        history, full = await _collect_history(
-            client, event.chat_id, cfg.context_messages,
-            store.transcripts(conn, event.chat_id))
-        # Её ответ закрывает исходы моих предыдущих сообщений в этом чате
-        if STATE["learning"]:
-            resolve_outcomes(conn, event.chat_id, history, incoming,
-                             event.date, cfg.learning.outcome_window_hours)
+        # Первую реплику серии запоминаем отдельно: исход — это «как быстро
+        # она ответила», и считать его надо по первой, иначе задержка
+        # окажется завышена на всю длину серии.
+        reply_text, reply_at = BURSTS.setdefault(event.chat_id,
+                                                 (incoming, event.date))
 
-        learned = _learned_style(conn, cfg, event.chat_id)
-        try:
-            analysis, variants = await asyncio.to_thread(suggester.analyze,
-                                                         history, sender_name,
-                                                         full, learned)
-        except SuggesterError:
-            await client.send_message(cfg.panel_chat, format_error(sender_name),
+        async def run_analysis():
+            """Дорогая часть: выполняется один раз, когда собеседник замолчал.
+
+            incoming, sender_name и ctx замкнуты на последнее сообщение серии
+            — предыдущие отложенные задачи по этому диалогу уже отменены.
+            """
+            BURSTS.pop(event.chat_id, None)
+            history, full = await _collect_history(
+                client, event.chat_id, cfg.context_messages,
+                store.transcripts(conn, event.chat_id))
+            # Её ответ закрывает исходы моих предыдущих сообщений в этом чате
+            if STATE["learning"]:
+                resolve_outcomes(conn, event.chat_id, history, reply_text,
+                                 reply_at, cfg.learning.outcome_window_hours)
+
+            learned = _learned_style(conn, cfg, event.chat_id)
+            try:
+                analysis, variants = await asyncio.to_thread(
+                    suggester.analyze, history, sender_name, full, learned)
+            except SuggesterError:
+                await client.send_message(
+                    cfg.panel_chat, format_error(sender_name), parse_mode=None)
+                return
+
+            if STATE["learning"]:
+                store.save_suggestion(conn, event.chat_id, cfg.tones, variants,
+                                      incoming)
+
+            text, entities = await _build_panel_message(
+                client, sender_name, ctx.sender_username, ctx.sender_id,
+                incoming, variants, analysis, cfg.tones)
+            await client.send_message(cfg.panel_chat, text,
+                                      formatting_entities=entities,
                                       parse_mode=None)
-            return
 
-        if STATE["learning"]:
-            store.save_suggestion(conn, event.chat_id, cfg.tones, variants,
-                                  incoming)
+        debouncer.schedule(event.chat_id, run_analysis)
 
-        text, entities = await _build_panel_message(
-            client, sender_name, ctx.sender_username, ctx.sender_id,
-            incoming, variants, analysis, cfg.tones)
-        await client.send_message(cfg.panel_chat, text,
-                                  formatting_entities=entities,
-                                  parse_mode=None)
-
-    print(f"Готово. Подсказки идут в: {cfg.panel_chat}. "
-          "Управление: /on /off, разбор чата: /hint, "
-          "самообучение: /train /stats /learn /forget")
+    watched = len(store.watched_chats(conn))
+    if cfg.watch_mode == "selected":
+        # Пустой список — молчащий бот, и по логам это не отличить от поломки
+        scope = (f"слежу за {watched} "
+                 f"{plural(watched, 'диалогом', 'диалогами', 'диалогами')}"
+                 if watched else
+                 "список наблюдения ПУСТ — суфлёр молчит везде, /watch @username")
+    else:
+        scope = "реагирую на всех подряд (watch_mode: all)"
+    pause = (f", склейка серий: {cfg.debounce_seconds:g} с"
+             if cfg.debounce_seconds else "")
+    print(f"Готово. Подсказки идут в: {cfg.panel_chat}. {scope}{pause}. "
+          "Управление: /on /off, разбор чата: /hint, наблюдение: "
+          "/watch /unwatch, самообучение: /train /stats /learn /forget")
     await client.run_until_disconnected()
 
 

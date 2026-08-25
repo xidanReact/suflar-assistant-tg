@@ -67,6 +67,24 @@ def format_stats(summary: dict, min_samples: int) -> str:
     return "\n".join(lines)
 
 
+def format_watchlist(people: list[dict], watch_mode: str) -> str:
+    """Ответ на /watch без аргумента: за кем суфлёр сейчас следит."""
+    if not people:
+        return ("👀 Список наблюдения пуст — суфлёр молчит везде, "
+                "работает только /hint.\n"
+                "Взять диалог под наблюдение: /watch @username")
+
+    lines = ["👀 Слежу за:"]
+    for p in people:
+        name = p.get("name") or "без имени"
+        lines.append(f"- {name} (@{p['username']})" if p.get("username")
+                     else f"- {name}")
+    if watch_mode != "selected":
+        lines.append("Список сейчас не используется: watch_mode: all — "
+                     "суфлёр реагирует на всех подряд.")
+    return "\n".join(lines)
+
+
 def format_error(sender_name: str) -> str:
     return (
         f"⚠️ Не смог сгенерировать варианты для чата с {sender_name}. "

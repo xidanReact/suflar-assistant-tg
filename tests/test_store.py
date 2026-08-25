@@ -4,7 +4,8 @@ from suflor.store import (
     open_store, save_suggestion, last_suggestion, save_sent, sent_exists,
     save_outcome, pending_outcomes, expire_pending, style_samples, tone_stats,
     suggestion_count, edited_pairs, forget_chat, learning_summary,
-    save_transcript, transcripts,
+    save_transcript, transcripts, watch, unwatch, watched_chats,
+    is_watched,
 )
 
 NOW = datetime(2026, 8, 24, 12, tzinfo=timezone.utc)
@@ -264,3 +265,52 @@ def test_forget_chat_wipes_transcripts_too(tmp_path):
     forget_chat(conn, 1)
     assert transcripts(conn, 1) == {}
     assert transcripts(conn, 2) == {10: "чужой"}
+
+
+def test_watching_a_chat_makes_it_watched(tmp_path):
+    conn = _store(tmp_path)
+    watch(conn, 1, "anna", NOW)
+    assert is_watched(conn, 1) is True
+    assert is_watched(conn, 2) is False
+
+
+def test_watched_chats_are_listed_in_the_order_they_were_added(tmp_path):
+    conn = _store(tmp_path)
+    watch(conn, 1, "anna", NOW)
+    watch(conn, 2, "kate", NOW + timedelta(minutes=1))
+    assert [(r["chat_id"], r["username"]) for r in watched_chats(conn)] == [
+        (1, "anna"), (2, "kate")]
+
+
+def test_watching_twice_does_not_duplicate(tmp_path):
+    conn = _store(tmp_path)
+    watch(conn, 1, "anna", NOW)
+    watch(conn, 1, "anna_new", NOW)
+    assert [r["username"] for r in watched_chats(conn)] == ["anna_new"]
+
+
+def test_unwatch_removes_only_that_chat(tmp_path):
+    conn = _store(tmp_path)
+    watch(conn, 1, "anna", NOW)
+    watch(conn, 2, "kate", NOW)
+    assert unwatch(conn, 1) is True
+    assert [r["chat_id"] for r in watched_chats(conn)] == [2]
+
+
+def test_unwatch_reports_when_there_was_nothing_to_remove(tmp_path):
+    assert unwatch(_store(tmp_path), 1) is False
+
+
+def test_watching_a_chat_without_a_username(tmp_path):
+    conn = _store(tmp_path)
+    watch(conn, 1, None, NOW)
+    assert is_watched(conn, 1) is True
+    assert watched_chats(conn)[0]["username"] is None
+
+
+def test_forget_chat_stops_watching(tmp_path):
+    # Стереть про человека всё, но продолжать за ним следить — странно
+    conn = _store(tmp_path)
+    watch(conn, 1, "anna", NOW)
+    forget_chat(conn, 1)
+    assert is_watched(conn, 1) is False

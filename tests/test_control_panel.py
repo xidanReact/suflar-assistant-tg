@@ -1,5 +1,6 @@
 from suflor.control_panel import (
     format_suggestions, format_error, build_chat_link,
+    format_watchlist,
 )
 
 
@@ -80,3 +81,23 @@ def test_format_stats_survives_an_empty_store():
                                  tones={}, avg_score=None), min_samples=5)
     assert "Выбранных вариантов пока нет" in text
     assert "Средняя оценка" not in text
+
+
+def test_watchlist_shows_names_and_usernames():
+    text = format_watchlist([{"name": "Аня", "username": "anna"},
+                             {"name": "Катя", "username": None}], "selected")
+    assert "Аня (@anna)" in text
+    assert "Катя" in text
+    assert "@None" not in text
+
+
+def test_empty_watchlist_says_the_bot_is_silent():
+    # В режиме selected пустой список — молчащий бот; об этом надо сказать
+    text = format_watchlist([], "selected")
+    assert "пуст" in text.lower()
+    assert "/watch" in text
+
+
+def test_watchlist_warns_that_the_list_is_unused_in_all_mode():
+    text = format_watchlist([{"name": "Аня", "username": "anna"}], "all")
+    assert "watch_mode" in text

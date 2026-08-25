@@ -134,3 +134,25 @@ def test_learning_ignores_unknown_keys(tmp_path):
     cfg_file.write_text("panel_chat: me\nlearning:\n  min_smaples: 3\n",
                         encoding="utf-8")
     assert load_config(str(cfg_file)).learning.min_samples == 5
+
+
+def test_watch_mode_defaults_to_all(tmp_path):
+    # Конфиг, написанный до списка наблюдения, не должен внезапно замолчать
+    cfg = load_config(_write(tmp_path, "panel_chat: me\n"))
+    assert cfg.watch_mode == "all"
+    assert cfg.debounce_seconds == 0.0
+
+
+def test_reads_watch_mode_and_debounce(tmp_path):
+    cfg = load_config(_write(tmp_path, "panel_chat: me\n"
+                                       "watch_mode: selected\n"
+                                       "debounce_seconds: 8\n"))
+    assert cfg.watch_mode == "selected"
+    assert cfg.debounce_seconds == 8.0
+
+
+def test_unknown_watch_mode_raises(tmp_path):
+    # Опечатка здесь — это молча замолчавший бот, неотличимый от поломки
+    path = _write(tmp_path, "panel_chat: me\nwatch_mode: selectd\n")
+    with pytest.raises(ValueError, match="selectd"):
+        load_config(path)
