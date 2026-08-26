@@ -71,6 +71,7 @@ def test_parse_reply_does_not_strip_a_comma_and_space():
     # символами, разбиралась как запятая с пробелом
     assert parse_reply(", привет ").text == ", привет"
 
+
 def test_parse_reply_preserves_internal_quotes():
     # Вторая кавычка внутри текста — не обёртка, а часть фразы
     assert (parse_reply('он сказал "да"').text ==
@@ -105,10 +106,26 @@ def test_parse_reply_rejects_lowercase_handoff():
     assert reply.handoff is None
 
 
-def test_parse_reply_recognises_uppercase_handoff():
-    # Только вверху регистра и в начале строки
-    reply = parse_reply("HANDOFF: причина")
-    assert reply.handoff == "причина"
+def test_parse_reply_recognises_title_case_handoff():
+    # Регистр не важен, работает и Title-case
+    reply = parse_reply("Handoff: договорились")
+    assert reply.handoff == "договорились"
+
+
+def test_parse_reply_recognises_handoff_without_reason():
+    # HANDOFF без двоеточия и причины — тоже передача диалога
+    reply = parse_reply("HANDOFF")
+    assert reply.handoff == "разговор дошёл до договорённостей"
+
+
+def test_parse_reply_rejects_emoji_only_is_fixed():
+    # Одинокий смайл — валидный текст
+    assert parse_reply("😀").text == "😀"
+
+
+def test_parse_reply_strips_numbering_even_in_quotes():
+    # Нумерация внутри кавычек должна быть удалена после unwrap
+    assert parse_reply('"1) ну такое"').text == "ну такое"
 
 
 def test_prompt_puts_the_model_in_my_shoes():
