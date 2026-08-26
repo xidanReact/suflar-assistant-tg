@@ -40,6 +40,25 @@ class Learning:
 
 
 @dataclass
+class Auto:
+    """Авторежим: бот сам пишет и отправляет ответ в отмеченных диалогах.
+
+    Список диалогов живёт в базе (команда /auto), здесь только правила игры.
+    Правки применяются при перезапуске.
+    """
+    enabled: bool = True
+    # Сколько ответ висит в пульте, прежде чем уйти собеседнику
+    cancel_window_seconds: float = 60.0
+    # Автоответов подряд без единого моего сообщения — дальше пауза
+    max_in_row: int = 10
+    typing_simulation: bool = True
+    # Обновлять сводку диалога раз в столько новых сообщений
+    memory_refresh_every: int = 10
+    # Сколько последних реплик кладём в промпт ответа
+    recent_messages: int = 40
+
+
+@dataclass
 class Config:
     panel_chat: str
     context_messages: int = 50
@@ -57,6 +76,7 @@ class Config:
     # Факты обо мне — текст файла about_file, уже прочитанный. Пустая строка,
     # пока профиля нет: промпт тогда обязан остаться прежним.
     about: str = ""
+    auto: Auto = field(default_factory=Auto)
 
 
 def _load_about(path: str, name: str | None) -> str:
@@ -92,6 +112,12 @@ def _load_learning(data: dict) -> Learning:
     return Learning(**{k: v for k, v in (data or {}).items() if k in known})
 
 
+def _load_auto(data: dict) -> Auto:
+    """Секции auto может не быть вовсе — старый конфиг должен работать."""
+    known = {f.name for f in fields(Auto)}
+    return Auto(**{k: v for k, v in (data or {}).items() if k in known})
+
+
 def load_config(path: str) -> Config:
     with open(path, "r", encoding="utf-8") as f:
         data = yaml.safe_load(f) or {}
@@ -110,4 +136,5 @@ def load_config(path: str) -> Config:
         about=_load_about(path, data.get("about_file")),
         watch_mode=_watch_mode(data.get("watch_mode")),
         debounce_seconds=float(data.get("debounce_seconds", 0)),
+        auto=_load_auto(data.get("auto")),
     )
