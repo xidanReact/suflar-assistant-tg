@@ -2,6 +2,7 @@ from datetime import datetime, timedelta, timezone
 
 from suflor.dialog import (
     format_history, elapsed_since_last, questions_asked, variants_word,
+    humanize_delta, initiative_summary,
 )
 
 NOW = datetime(2026, 8, 25, 12, tzinfo=timezone.utc)
@@ -91,3 +92,64 @@ def test_variants_word_handles_teens():
     assert variants_word(3) == "варианта"
     assert variants_word(11) == "вариантов"
     assert variants_word(21) == "вариант"
+
+
+def test_humanize_delta_scales_units():
+    assert humanize_delta(30) == "меньше минуты"
+    assert humanize_delta(60 * 5) == "5 минут"
+    assert humanize_delta(3600 * 2) == "2 часа"
+    assert humanize_delta(86400 * 3) == "3 дня"
+    assert humanize_delta(86400 * 90) == "3 месяца"
+
+
+def test_humanize_delta_clamps_negative_skew():
+    assert humanize_delta(-100) == "меньше минуты"
+
+
+def test_initiative_names_who_started_when_history_is_whole():
+    history = [_msg("привет", 60), _msg("о, привет", 55, from_me=True)]
+    summary = initiative_summary(history, "Аня")
+    assert "начал переписку: Аня" in summary
+    assert "последним писал: я" in summary
+
+
+def test_initiative_marks_my_first_message():
+    history = [_msg("привет", 60, from_me=True), _msg("хай", 55)]
+    summary = initiative_summary(history, "Аня")
+    assert "начал переписку: я" in summary
+    assert "последним писал: Аня" in summary
+
+
+def test_initiative_counts_messages_on_both_sides():
+    history = [_msg("а", 60), _msg("б", 55, from_me=True), _msg("в", 50)]
+    assert "сообщений всего: Аня — 2, я — 1" in initiative_summary(
+        history, "Аня")
+
+
+def test_initiative_counts_who_breaks_long_silences():
+    history = [
+        _msg("привет", 60 * 24 * 3),
+        _msg("ну как ты", 60 * 24 * 2),
+        _msg("нормально", 60 * 24 * 2 - 5, from_me=True),
+        _msg("давно не виделись", 30, from_me=True),
+    ]
+    summary = initiative_summary(history, "Аня")
+    assert "после долгой паузы: Аня — 1 раз, я — 1 раз" in summary
+
+
+def test_initiative_omits_pause_line_without_long_pauses():
+    history = [_msg("привет", 40), _msg("хай", 35, from_me=True)]
+    assert "после долгой паузы" not in initiative_summary(history, "Аня")
+
+
+def test_initiative_admits_when_start_is_cut_off_by_the_limit():
+    # Обрезанная лимитом переписка: первый в выборке ≠ начавший диалог
+    history = [_msg("привет", 60), _msg("о, привет", 55, from_me=True)]
+    summary = initiative_summary(history, "Аня", full_history=False)
+    assert "начал переписку" not in summary
+    assert "начало переписки не видно" in summary
+    assert "последним писал: я" in summary
+
+
+def test_initiative_empty_for_empty_history():
+    assert initiative_summary([], "Аня") == ""
