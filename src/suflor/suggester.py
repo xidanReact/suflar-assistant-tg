@@ -1,11 +1,11 @@
 import re
 from datetime import datetime
-from openai import OpenAI
 
 from suflor.dialog import (
     format_history, elapsed_since_last, initiative_summary, questions_asked,
     facts_rules, plural, variants_word, times_word, humanize_delta,
 )
+from suflor.llm import LLMError, make_client, complete
 
 _NUMBERED = re.compile(r"^\d+[)\].:-]\s*(.+)$")
 
@@ -16,9 +16,9 @@ _ANALYSIS_LABEL = re.compile(
 # Замерено на deepseek-v4-flash и -pro: рассуждения занимают 1900–3900 токенов
 _REASONING_BUDGET = 6000
 
-
-class SuggesterError(Exception):
-    pass
+# Имя, под которым ошибку ловит main и тесты: снаружи это по-прежнему
+# «суфлёр не смог», внутри — общая ошибка обращения к модели
+SuggesterError = LLMError
 
 
 def build_system_prompt(tones: list[str], style: str,
@@ -149,10 +149,11 @@ def parse_analysis(raw: str) -> str:
 
 
 class Suggester:
-    def __init__(self, api_key: str, tones: list[str], style: str,
-                 temperature: float = 0.7,
-                 model: str = "deepseek-v4-pro", about: str = ""):
-        self._client = OpenAI(api_key=api_key, base_url="https://api.deepseek.com")
+    def __init__(self, api_key: str | None = None, tones: list[str] = None,
+                 style: str = "", temperature: float = 0.7,
+                 model: str = "deepseek-v4-pro", about: str = "",
+                 client=None):
+        self._client = client or make_client(api_key)
         self._model = model
         self._tones = tones
         self._style = style
@@ -169,25 +170,11 @@ class Suggester:
     def _complete(self, system_prompt: str, history: list[dict],
                   max_tokens: int, partner_name: str | None = None,
                   full_history: bool = True) -> str:
-        try:
-            resp = self._client.chat.completions.create(
-                model=self._model,
-                messages=build_messages(history, system_prompt,
-                                        partner_name=partner_name,
-                                        full_history=full_history),
-                temperature=self._temperature,
-                max_tokens=max_tokens,
-            )
-        except Exception as e:
-            raise SuggesterError(str(e)) from e
-
-        choice = resp.choices[0]
-        content = choice.message.content or ""
-        if not content and choice.finish_reason == "length":
-            raise SuggesterError(
-                "рассуждения модели съели весь max_tokens, на ответ не "
-                "осталось места — увеличь лимит")
-        return content
+        return complete(
+            self._client, self._model,
+            build_messages(history, system_prompt, partner_name=partner_name,
+                           full_history=full_history),
+            self._temperature, max_tokens)
 
     def analyze(self, history: list[dict],
                 partner_name: str | None = None,
