@@ -59,6 +59,51 @@ def test_parse_reply_empty_gives_nothing():
     assert empty.text is None and empty.handoff is None
 
 
+def test_parse_reply_strips_typographic_quotes():
+    # DeepSeek часто оборачивает русский текст в типографские кавычки
+    assert parse_reply('"ну такое"').text == "ну такое"
+
+
+def test_parse_reply_preserves_internal_quotes():
+    # Вторая кавычка внутри текста — не обёртка, а часть фразы
+    assert (parse_reply('он сказал "да"').text ==
+            'он сказал "да"')
+
+
+def test_parse_reply_preserves_multiple_quote_pairs():
+    # Несколько пар кавычек — всё это часть текста, не обёртка
+    assert parse_reply('«да» и «нет»').text == '«да» и «нет»'
+
+
+def test_parse_reply_rejects_only_punctuation():
+    # Мусор из одних знаков препинания — не валидный ответ
+    assert parse_reply("...").text is None
+    assert parse_reply("?!").text is None
+
+
+def test_parse_reply_preserves_times():
+    # Время вида 18:00 не должно быть повреждено префиксной регуляркой
+    assert parse_reply("18:00 подойдёт").text == "18:00 подойдёт"
+
+
+def test_parse_reply_preserves_smileys():
+    # Смайл «я :)» не должен быть повреждён префиксной регуляркой
+    assert parse_reply("я :) не знаю").text == "я :) не знаю"
+
+
+def test_parse_reply_rejects_lowercase_handoff():
+    # handoff в обычной фразе не передаёт диалог, это просто текст
+    reply = parse_reply("— handoff бывает разный")
+    assert reply.text == "— handoff бывает разный"
+    assert reply.handoff is None
+
+
+def test_parse_reply_recognises_uppercase_handoff():
+    # Только вверху регистра и в начале строки
+    reply = parse_reply("HANDOFF: причина")
+    assert reply.handoff == "причина"
+
+
 def test_prompt_puts_the_model_in_my_shoes():
     prompt = build_reply_prompt("стиль")
     assert "от первого лица" in prompt
@@ -164,6 +209,12 @@ def test_reply_passes_handoff_through():
 def test_reply_raises_on_empty_model_answer():
     with pytest.raises(LLMError, match="пуст"):
         _responder_with_reply("   ").reply([_msg("привет")])
+
+
+def test_reply_raises_on_punctuation_only_answer():
+    # Мусор из знаков препинания — не валидный ответ
+    with pytest.raises(LLMError, match="пуст"):
+        _responder_with_reply("...").reply([_msg("привет")])
 
 
 def test_reply_raises_on_api_error():
