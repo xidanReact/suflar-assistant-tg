@@ -61,8 +61,15 @@ def test_parse_reply_empty_gives_nothing():
 
 def test_parse_reply_strips_typographic_quotes():
     # DeepSeek часто оборачивает русский текст в типографские кавычки
-    assert parse_reply('"ну такое"').text == "ну такое"
+    assert parse_reply("\u201cну такое\u201d").text == "ну такое"
 
+
+
+
+def test_parse_reply_does_not_strip_a_comma_and_space():
+    # Страховка от прежней ошибки: пара кавычек, записанная сырыми
+    # символами, разбиралась как запятая с пробелом
+    assert parse_reply(", привет ").text == ", привет"
 
 def test_parse_reply_preserves_internal_quotes():
     # Вторая кавычка внутри текста — не обёртка, а часть фразы
