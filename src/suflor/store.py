@@ -59,6 +59,13 @@ CREATE TABLE IF NOT EXISTS watched (
     added_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS auto_chats (
+    chat_id INTEGER PRIMARY KEY,
+    username TEXT,
+    paused_reason TEXT,
+    added_at TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_sent_chat ON sent(chat_id, sent_at);
 CREATE INDEX IF NOT EXISTS idx_suggestions_chat
     ON suggestions(chat_id, created_at);
@@ -258,6 +265,7 @@ def forget_chat(conn, chat_id: int) -> None:
     conn.execute("DELETE FROM suggestions WHERE chat_id = ?", (chat_id,))
     conn.execute("DELETE FROM transcripts WHERE chat_id = ?", (chat_id,))
     conn.execute("DELETE FROM watched WHERE chat_id = ?", (chat_id,))
+    conn.execute("DELETE FROM auto_chats WHERE chat_id = ?", (chat_id,))
     conn.commit()
 
 
@@ -315,6 +323,95 @@ def is_watched(conn, chat_id: int) -> bool:
                         (chat_id,)).fetchone() is not None
 
 
+def auto_on(conn, chat_id: int, username: str | None,
+            added_at: datetime | None = None) -> None:
+    """Поставить диалог на автопилот. Повтор освежает username и
+    снимает паузу: /auto — это «продолжай, я разрулил».
+    """
+    conn.execute(
+        "INSERT INTO auto_chats (chat_id, username, paused_reason, added_at) "
+        "VALUES (?, ?, NULL, ?) ON CONFLICT(chat_id) DO UPDATE SET "
+        "username = excluded.username, paused_reason = NULL",
+        (chat_id, username, _iso(added_at or datetime.now(timezone.utc))))
+    conn.commit()
+
+
+def auto_off(conn, chat_id: int) -> bool:
+    """Снять с автопилота.
+
+    False — его там и не было.
+    """
+    removed = conn.execute("DELETE FROM auto_chats WHERE chat_id = ?",
+                           (chat_id,)).rowcount
+    conn.commit()
+    return bool(removed)
+
+
+def auto_chats(conn) -> list:
+    """Весь список, включая диалоги на паузе.
+
+    В порядке добавления.
+    """
+    return conn.execute(
+        "SELECT chat_id, username, paused_reason, added_at FROM auto_chats "
+        "ORDER BY added_at, chat_id").fetchall()
+
+
+def auto_state(conn, chat_id: int) -> dict | None:
+    row = conn.execute(
+        "SELECT chat_id, username, paused_reason FROM auto_chats "
+        "WHERE chat_id = ?", (chat_id,)).fetchone()
+    if row is None:
+        return None
+    return {"chat_id": row["chat_id"], "username": row["username"],
+            "paused_reason": row["paused_reason"]}
+
+
+def is_auto(conn, chat_id: int) -> bool:
+    """Отвечать ли в этом диалоге самому.
+
+    Пауза считается за «нет».
+    """
+    state = auto_state(conn, chat_id)
+    return state is not None and state["paused_reason"] is None
+
+
+def pause_auto(conn, chat_id: int, reason: str) -> None:
+    conn.execute("UPDATE auto_chats SET paused_reason = ? WHERE chat_id = ?",
+                 (reason, chat_id))
+    conn.commit()
+
+
+def resume_auto(conn, chat_id: int) -> bool:
+    """Снять паузу.
+
+    False — диалога нет в списке или паузы не было.
+    """
+    changed = conn.execute(
+        "UPDATE auto_chats SET paused_reason = NULL "
+        "WHERE chat_id = ? AND paused_reason IS NOT NULL",
+        (chat_id,)).rowcount
+    conn.commit()
+    return bool(changed)
+
+
+def auto_in_row(conn, chat_id: int, cap: int = 50) -> int:
+    """Подряд идущие автосообщения в хвосте.
+
+    По хвосту: моё сообщение обнуляет счёт. Дальше не смотрим, лимит
+    в десятки.
+    """
+    rows = conn.execute(
+        "SELECT source FROM sent WHERE chat_id = ? "
+        "ORDER BY sent_at DESC, id DESC LIMIT ?", (chat_id, cap))
+    count = 0
+    for row in rows:
+        if row["source"] != "auto":
+            break
+        count += 1
+    return count
+
+
 def learning_summary(conn) -> dict:
     """Сводка для /stats."""
     placeholders = ", ".join("?" * len(MY_OWN_SOURCES))
@@ -325,6 +422,13 @@ def learning_summary(conn) -> dict:
         "SELECT COUNT(*) AS sent, COUNT(DISTINCT chat_id) AS chats FROM sent"
     ).fetchone()
     avg = conn.execute("SELECT AVG(score) AS s FROM outcomes").fetchone()["s"]
+    auto = conn.execute(
+        "SELECT COUNT(*) AS n FROM sent WHERE source = 'auto'"
+    ).fetchone()["n"]
+    auto_score = conn.execute(
+        "SELECT AVG(o.score) AS s FROM outcomes o JOIN sent s "
+        "ON s.id = o.sent_id WHERE s.source = 'auto'").fetchone()["s"]
     return {"samples": samples, "sent": totals["sent"],
             "chats": totals["chats"], "suggestions": suggestion_count(conn),
-            "tones": tone_stats(conn), "avg_score": avg}
+            "tones": tone_stats(conn), "avg_score": avg, "auto": auto,
+            "auto_score": auto_score}
