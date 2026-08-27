@@ -5,7 +5,7 @@ from suflor.main import (
     resolve_incoming_text,
     _ask_password, _collect_history, record_outgoing, resolve_outcomes,
     harvest_chat, _is_harvestable, auto_pause_reason, is_bot_echo,
-    SENT_BY_BOT,
+    SENT_BY_BOT, parse_auto_arg,
 )
 from suflor.store import (
     open_store, save_suggestion, style_samples, tone_stats,
@@ -413,3 +413,23 @@ def test_bot_echo_is_recognised_once():
 def test_bot_echo_is_false_for_my_own_message():
     SENT_BY_BOT.clear()
     assert is_bot_echo(1, 100) is False
+
+
+def test_parse_auto_arg_reads_plain_target():
+    assert parse_auto_arg("@anya") == (True, "@anya")
+
+
+def test_parse_auto_arg_reads_the_off_form():
+    assert parse_auto_arg("off @anya") == (False, "@anya")
+
+
+def test_parse_auto_arg_accepts_russian_off():
+    assert parse_auto_arg("выкл @anya") == (False, "@anya")
+
+
+def test_parse_auto_arg_of_empty_string():
+    assert parse_auto_arg("") == (True, "")
+
+
+def test_parse_auto_arg_does_not_eat_a_username_starting_with_off():
+    assert parse_auto_arg("@offline_girl") == (True, "@offline_girl")

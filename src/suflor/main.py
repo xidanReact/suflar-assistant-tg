@@ -249,6 +249,21 @@ def parse_hint_target(arg: str) -> str | int | None:
     return m.group(1) if m else None
 
 
+_AUTO_OFF = ("off", "выкл", "стоп")
+
+
+def parse_auto_arg(arg: str) -> tuple[bool, str]:
+    """«off @anya» — выключить, «@anya» — включить.
+
+    Слово-выключатель отделяется только пробелом: @offline_girl — это
+    username, а не команда.
+    """
+    parts = (arg or "").strip().split(None, 1)
+    if parts and parts[0].lower() in _AUTO_OFF:
+        return False, parts[1].strip() if len(parts) > 1 else ""
+    return True, (arg or "").strip()
+
+
 def forward_origin(message) -> int | None:
     """Автор пересланного сообщения. None, если форварда нет или он скрыт."""
     fwd = getattr(message, "forward", None) if message else None
@@ -336,6 +351,80 @@ async def _handle_watch(client, conn, cfg, arg: str):
     await client.send_message(
         cfg.panel_chat, f"Слежу за {name}. Всего в списке: {total}.{note}",
         parse_mode=None)
+
+
+async def _handle_auto(client, conn, cfg, autopilot, arg: str):
+    """Управление автопилотом, а без аргумента — список диалогов."""
+    turn_on, target_arg = parse_auto_arg(arg)
+    if not target_arg:
+        people = []
+        for row in store.auto_chats(conn):
+            try:
+                entity = await client.get_entity(row["chat_id"])
+                name = utils.get_display_name(entity)
+            except (ValueError, TypeError, errors.RPCError):
+                name = None
+            people.append({"name": name, "username": row["username"],
+                           "paused_reason": row["paused_reason"]})
+        await client.send_message(
+            cfg.panel_chat, format_auto_list(people, cfg.auto.enabled),
+            parse_mode=None)
+        return
+
+    usage = ("Кому отвечать самому? «/auto @username», выключить — "
+             "«/auto off @username».")
+    entity = await _resolve_target(client, cfg, target_arg, usage)
+    if entity is None:
+        return
+
+    name = utils.get_display_name(entity) or str(target_arg)
+    chat_id = utils.get_peer_id(entity)
+    if not turn_on:
+        autopilot.cancel(chat_id)
+        known = store.auto_off(conn, chat_id)
+        note = (f"Больше не отвечаю за тебя в чате с {name}." if known
+                else f"За тебя в чате с {name} я и не отвечал.")
+        await client.send_message(cfg.panel_chat, note, parse_mode=None)
+        return
+
+    store.auto_on(conn, chat_id, getattr(entity, "username", None))
+    total = len(store.auto_chats(conn))
+    note = ("" if cfg.auto.enabled
+            else " Но в конфиге auto.enabled: false — режим выключен целиком.")
+    await client.send_message(
+        cfg.panel_chat,
+        f"Отвечаю сам в чате с {name}. Всего на автопилоте: {total}."
+        f"{note}", parse_mode=None)
+
+
+async def _handle_stop(client, conn, cfg, autopilot, arg: str):
+    """Отменить ответ, висящий в окне отмены."""
+    if arg:
+        entity = await _resolve_target(
+            client, cfg, arg, "Чей ответ отменить? «/stop @username».")
+        if entity is None:
+            return
+        cancelled = autopilot.cancel(utils.get_peer_id(entity))
+        name = utils.get_display_name(entity) or str(arg)
+        note = (f"Отменил ответ в чат с {name}." if cancelled
+                else f"В чате с {name} ничего не ждало отправки.")
+        await client.send_message(cfg.panel_chat, note, parse_mode=None)
+        return
+
+    waiting = autopilot.all_pending()
+    if not waiting:
+        await client.send_message(cfg.panel_chat,
+                                  "Ничего не ждёт отправки.", parse_mode=None)
+        return
+    if len(waiting) > 1:
+        await client.send_message(
+            cfg.panel_chat,
+            f"Ответов в очереди: {len(waiting)}. Скажи, какой отменить: "
+            "«/stop @username».", parse_mode=None)
+        return
+    autopilot.cancel(waiting[0].chat_id)
+    await client.send_message(cfg.panel_chat, "Отменил, ответ не уйдёт.",
+                              parse_mode=None)
 
 
 async def _handle_unwatch(client, conn, cfg, arg: str):
@@ -581,9 +670,37 @@ async def _amain():
                 await _handle_unwatch(client, conn, cfg,
                                       cmd[len("/unwatch"):].strip())
                 return
+            if cmd == "/auto" or cmd.startswith("/auto "):
+                await _handle_auto(client, conn, cfg, autopilot,
+                                   cmd[len("/auto"):].strip())
+                return
+            if cmd == "/stop" or cmd.startswith("/stop "):
+                await _handle_stop(client, conn, cfg, autopilot,
+                                   cmd[len("/stop"):].strip())
+                return
             if cmd == "/forget" or cmd.startswith("/forget "):
                 await _handle_forget(client, conn, cfg,
                                      cmd[len("/forget"):].strip())
+                return
+
+            # Реплай на карточку — не команда и со слэша не начинается,
+            # поэтому идёт после всех команд
+            reply_to = event.reply_to_msg_id
+            target_chat = (autopilot.chat_for_card(reply_to)
+                           if reply_to else None)
+            if target_chat is not None and event.raw_text.strip():
+                # Я перехватил ответ своим текстом: бота снимаем, отправляем
+                # моё и записываем как правку — это мой текст, он годится
+                # в образцы манеры
+                autopilot.cancel(target_chat)
+                message = await client.send_message(target_chat,
+                                                    event.raw_text)
+                SENT_BY_BOT.add((target_chat, message.id))
+                store.save_sent(conn, target_chat, event.raw_text, "edited",
+                                sent_at=message.date)
+                await client.send_message(cfg.panel_chat,
+                                          "Отправил твой текст.",
+                                          parse_mode=None)
                 return
 
         # Моё сообщение в живом чате — образец манеры или выбор варианта.
@@ -719,11 +836,16 @@ async def _amain():
                  "командой /watch @username")
     else:
         scope = "Реагирую на всех подряд (watch_mode: all)"
+    on_auto = len(store.auto_chats(conn))
+    auto_note = (f", на автопилоте: {on_auto}" if cfg.auto.enabled and on_auto
+                 else "")
     pause = (f", склейка серий: {cfg.debounce_seconds:g} с"
              if cfg.debounce_seconds else "")
-    print(f"Готово. Подсказки идут в: {cfg.panel_chat}. {scope}{pause}. "
+    print(f"Готово. Подсказки идут в: {cfg.panel_chat}. "
+          f"{scope}{auto_note}{pause}. "
           "Управление: /on /off, разбор чата: /hint, наблюдение: "
-          "/watch /unwatch, самообучение: /train /stats /learn /forget")
+          "/watch /unwatch, автоответы: /auto /stop, самообучение: "
+          "/train /stats /learn /forget")
     await client.run_until_disconnected()
 
 
