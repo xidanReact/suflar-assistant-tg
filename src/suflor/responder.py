@@ -7,6 +7,7 @@
 пустоту — дежурную фразу, к которой не придраться.
 """
 import re
+import unicodedata
 from dataclasses import dataclass
 from datetime import datetime
 
@@ -19,11 +20,12 @@ DEFAULT_MODEL = "deepseek-v4-pro"
 # списываются из того же лимита, что и ответ
 _REASONING_BUDGET = 6000
 
-# HANDOFF — только служебная строка целиком: слово, а за ним двоеточие
-# или конец строки. Регистр не важен (модель пишет и «Handoff:»), а вот
-# «handoff бывает разный» в середине живой фразы передачей не считается.
-_HANDOFF = re.compile(r"^\W{0,3}HANDOFF\b\s*(?::\s*(.*))?$",
-                      re.IGNORECASE)
+# HANDOFF - служебная строка целиком. Разделитель обязателен: без него
+# слово handoff в середине живой фразы считалось бы передачей диалога.
+# Звёздочки вокруг слова терпим, модели любят markdown-жирный
+_HANDOFF = re.compile(
+    r"^\W{0,3}HANDOFF\**\s*(?:[:\-\u2014\u2013]\s*(.*)|$)",
+    re.IGNORECASE)
 _HANDOFF_DEFAULT = "разговор дошёл до договорённостей"
 
 # Нумерация — только с пробелом после и без двоеточия в разделителях,
@@ -36,14 +38,21 @@ _PREFIX = re.compile(r"^(?:\d+[)\.]\s+)?(?:я:\s+)?", re.IGNORECASE)
 # символы не переживают редактирование файла
 _QUOTE_PAIRS = (("«", "»"), ('"', '"'), ("\u201c", "\u201d"), ("'", "'"))
 
-# Мусором считаем ответ, в котором нет ничего, кроме знаков препинания и
-# пробелов. Через \w это не выразить: для регулярок эмодзи такой же
-# «не-словесный» символ, как точка, а одинокий смайл — живая реплика
-_PUNCTUATION = " \t\n\r!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~«»""„—–…"
 
-def _is_junk(text: str) -> bool:
-    """Проверить, что ответ состоит только из пунктуации и пробелов."""
-    return all(ch in _PUNCTUATION for ch in text)
+def _has_content(text: str) -> bool:
+    """Есть ли в ответе хоть что-то, кроме знаков препинания.
+
+    По категориям Unicode, а не по списку символов: список уже дважды
+    терял кавычки при редактировании, и каждый раз мусор проезжал в
+    отправку. Буквы (L*) и цифры (N*) - содержание; эмодзи (So) тоже,
+    одинокий смайл в переписке нормальная реплика. Стрелки и буллеты
+    (Sm, Po) содержанием не считаются.
+    """
+    for ch in text:
+        category = unicodedata.category(ch)
+        if category[0] in ("L", "N") or category == "So":
+            return True
+    return False
 
 
 @dataclass
@@ -82,14 +91,19 @@ def parse_reply(raw: str) -> Reply:
         match = _HANDOFF.match(line)
         if match:
             reason = match.group(1)
-            return Reply(handoff=(reason.strip() if reason else None)
-                         or _HANDOFF_DEFAULT)
+            # Остатки markdown: **HANDOFF:** причина даёт "** причина"
+            reason = reason.strip("*_ ") if reason else ""
+            return Reply(handoff=reason or _HANDOFF_DEFAULT)
     if not lines:
         return Reply()
     text = _PREFIX.sub("", " ".join(lines)).strip()
-    text = _unwrap(text)
-    text = _PREFIX.sub("", text).strip()
-    if _is_junk(text):
+    unwrapped = _unwrap(text)
+    if unwrapped != text:
+        # Нумерация могла прятаться под кавычками. Второй проход только
+        # здесь: безусловный съедал законное начало реплики, и ответ
+        # "5) баллов из 10" превращался в "баллов из 10"
+        text = _PREFIX.sub("", unwrapped).strip()
+    if not _has_content(text):
         return Reply()
     return Reply(text=text)
 
