@@ -8,7 +8,7 @@ from suflor.store import (
     suggestion_count, edited_pairs, forget_chat, learning_summary,
     save_transcript, transcripts, watch, unwatch, watched_chats,
     is_watched, auto_on, auto_off, auto_chats, is_auto, pause_auto,
-    resume_auto, auto_state, auto_in_row,
+    resume_auto, auto_state, auto_in_row, save_memory, memory,
 )
 
 NOW = datetime(2026, 8, 24, 12, tzinfo=timezone.utc)
@@ -417,3 +417,38 @@ def test_learning_summary_counts_auto_messages(tmp_path):
     summary = learning_summary(conn)
     assert summary["auto"] == 1
     assert summary["auto_score"] == pytest.approx(0.8)
+
+
+def test_memory_is_none_until_saved(tmp_path):
+    assert memory(_store(tmp_path), 1) is None
+
+
+def test_save_memory_round_trip(tmp_path):
+    conn = _store(tmp_path)
+    save_memory(conn, 1, "Аня, 24, из Томска", 30, NOW)
+    stored = memory(conn, 1)
+    assert stored["summary"] == "Аня, 24, из Томска"
+    assert stored["msg_count"] == 30
+    assert stored["updated_at"] == NOW
+
+
+def test_save_memory_overwrites_the_previous_summary(tmp_path):
+    # Сводка одна на диалог: она переписывается, а не копится версиями
+    conn = _store(tmp_path)
+    save_memory(conn, 1, "старая", 10, NOW)
+    save_memory(conn, 1, "новая", 20, NOW)
+    assert memory(conn, 1)["summary"] == "новая"
+    assert memory(conn, 1)["msg_count"] == 20
+
+
+def test_memory_is_per_chat(tmp_path):
+    conn = _store(tmp_path)
+    save_memory(conn, 1, "про Аню", 10, NOW)
+    assert memory(conn, 2) is None
+
+
+def test_forget_chat_erases_the_summary(tmp_path):
+    conn = _store(tmp_path)
+    save_memory(conn, 1, "про Аню", 10, NOW)
+    forget_chat(conn, 1)
+    assert memory(conn, 1) is None

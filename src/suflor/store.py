@@ -66,6 +66,13 @@ CREATE TABLE IF NOT EXISTS auto_chats (
     added_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS dialog_memory (
+    chat_id INTEGER PRIMARY KEY,
+    summary TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    msg_count INTEGER NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_sent_chat ON sent(chat_id, sent_at);
 CREATE INDEX IF NOT EXISTS idx_suggestions_chat
     ON suggestions(chat_id, created_at);
@@ -266,6 +273,7 @@ def forget_chat(conn, chat_id: int) -> None:
     conn.execute("DELETE FROM transcripts WHERE chat_id = ?", (chat_id,))
     conn.execute("DELETE FROM watched WHERE chat_id = ?", (chat_id,))
     conn.execute("DELETE FROM auto_chats WHERE chat_id = ?", (chat_id,))
+    conn.execute("DELETE FROM dialog_memory WHERE chat_id = ?", (chat_id,))
     conn.commit()
 
 
@@ -410,6 +418,33 @@ def auto_in_row(conn, chat_id: int, cap: int = 50) -> int:
             break
         count += 1
     return count
+
+
+def save_memory(conn, chat_id: int, summary: str, msg_count: int,
+                updated_at: datetime | None = None) -> None:
+    """Переписать сводку диалога.
+
+    msg_count — длина истории на момент обновления. По разнице с текущей
+    длиной решается, пора ли обновлять сводку снова.
+    """
+    conn.execute(
+        "INSERT INTO dialog_memory (chat_id, summary, updated_at, msg_count) "
+        "VALUES (?, ?, ?, ?) ON CONFLICT(chat_id) DO UPDATE SET "
+        "summary = excluded.summary, updated_at = excluded.updated_at, "
+        "msg_count = excluded.msg_count",
+        (chat_id, summary, _iso(updated_at or datetime.now(timezone.utc)),
+         msg_count))
+    conn.commit()
+
+
+def memory(conn, chat_id: int) -> dict | None:
+    row = conn.execute(
+        "SELECT summary, updated_at, msg_count FROM dialog_memory "
+        "WHERE chat_id = ?", (chat_id,)).fetchone()
+    if row is None:
+        return None
+    return {"summary": row["summary"], "msg_count": row["msg_count"],
+            "updated_at": _dt(row["updated_at"])}
 
 
 def learning_summary(conn) -> dict:
