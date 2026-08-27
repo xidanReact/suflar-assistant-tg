@@ -14,11 +14,15 @@ from suflor.dialog import plural
 from suflor.suggester import Suggester, SuggesterError
 from suflor.matching import classify_sent
 from suflor.outcome import reply_stats, score_reply, has_question
-from suflor import store, profile, media
+from suflor import store, profile, media, handoff, llm
+from suflor.autopilot import Autopilot
+from suflor.responder import Responder
+from suflor.llm import LLMError
 from suflor.debounce import Debouncer
 from suflor.control_panel import (
     format_suggestions, format_error, format_stats, build_chat_link,
-    utf16_span, format_watchlist,
+    utf16_span, format_watchlist, format_auto_card, format_auto_sent,
+    format_handoff, format_auto_list, format_send_error,
 )
 
 load_dotenv()
@@ -34,6 +38,40 @@ STATE = {"enabled": True, "learning": True}
 # Начало текущей серии реплик по диалогу: chat_id -> (текст, время).
 # Нужно, чтобы склейка не портила замер скорости ответа.
 BURSTS: dict[int, tuple[str, object]] = {}
+
+# Сообщения, отправленные ботом: (chat_id, message_id). Они вернутся в
+# обработчик как мои исходящие, и без этой отметки уехали бы в корпус манеры
+# как мой собственный текст — модель начала бы учиться на самой себе.
+SENT_BY_BOT: set[tuple[int, int]] = set()
+
+# Как зовут собеседника в диалоге. Отправка происходит через минуту после
+# разбора, отдельной задачей, и знает только chat_id — а в пульте писать
+# «отправлено в 123456789» вместо имени незачем.
+NAMES: dict[int, str] = {}
+
+
+def is_bot_echo(chat_id: int, msg_id: int) -> bool:
+    """Это эхо нашей же отправки? Отметка разовая: множество не должно расти."""
+    key = (chat_id, msg_id)
+    if key in SENT_BY_BOT:
+        SENT_BY_BOT.discard(key)
+        return True
+    return False
+
+
+def auto_pause_reason(conn, cfg, incoming: str, chat_id: int) -> str | None:
+    """Причина не отвечать самому — или None, если можно.
+
+    Обе проверки дешёвые и идут до обращения к модели: платить за ответ,
+    который всё равно не уйдёт, незачем.
+    """
+    reason = handoff.detect(incoming)
+    if reason:
+        return reason
+    in_row = store.auto_in_row(conn, chat_id)
+    if in_row >= cfg.auto.max_in_row:
+        return f"{in_row} автоответов подряд без тебя"
+    return None
 
 
 async def _collect_history(client, chat_id, limit, transcripts=None):
@@ -449,9 +487,13 @@ async def _amain():
     deepseek_key = os.environ["DEEPSEEK_API_KEY"]
 
     cfg = load_config(CONFIG_PATH)
-    suggester = Suggester(api_key=deepseek_key, tones=cfg.tones,
-                          style=cfg.style, temperature=cfg.temperature,
-                          model=cfg.model, about=cfg.about)
+    llm_client = llm.make_client(deepseek_key)
+    suggester = Suggester(tones=cfg.tones, style=cfg.style,
+                          temperature=cfg.temperature, model=cfg.model,
+                          about=cfg.about, client=llm_client)
+    responder = Responder(client=llm_client, style=cfg.style,
+                          temperature=cfg.temperature, model=cfg.model,
+                          about=cfg.about)
 
     conn = store.open_store(DB_PATH)
     # Диалоги, заглохшие ещё до перезапуска, ответа уже не дождутся
@@ -467,6 +509,27 @@ async def _amain():
 
     transcriber = media.Transcriber(client)
     debouncer = Debouncer(cfg.debounce_seconds)
+
+    async def send_auto(chat_id: int, text: str, typing_seconds: float):
+        """Отправка автоответа. Всё, что связано с Telethon, живёт здесь."""
+        name = NAMES.get(chat_id, str(chat_id))
+        try:
+            if typing_seconds:
+                async with client.action(chat_id, "typing"):
+                    await asyncio.sleep(typing_seconds)
+            message = await client.send_message(chat_id, text)
+        except errors.RPCError:
+            await client.send_message(
+                cfg.panel_chat, format_send_error(name, text), parse_mode=None)
+            return
+
+        SENT_BY_BOT.add((chat_id, message.id))
+        store.save_sent(conn, chat_id, text, "auto", sent_at=message.date)
+        await client.send_message(
+            cfg.panel_chat, format_auto_sent(name, text), parse_mode=None)
+
+    autopilot = Autopilot(send_auto, cfg.auto.cancel_window_seconds,
+                          cfg.auto.typing_simulation)
 
     @client.on(events.Raw(types.UpdateTranscribedAudio))
     async def _on_transcribed(update):
@@ -527,6 +590,12 @@ async def _amain():
         # Пишется до фильтра should_suggest: тот режет исходящие, а нам они и
         # нужны. Пульт исключён явно, иначе в корпус уедут /on и /hint.
         if event.out and event.chat_id != panel_id and event.is_private:
+            if is_bot_echo(event.chat_id, event.message.id):
+                return          # это наш же автоответ, он уже записан
+            # Я вмешался в разговор: запланированный ответ снимаем, а паузу
+            # авторежима, наоборот, снимаем — разрулил, пусть продолжает
+            autopilot.cancel(event.chat_id)
+            store.resume_auto(conn, event.chat_id)
             if STATE["learning"]:
                 record_outgoing(conn, event.chat_id, event.raw_text,
                                 event.date,
@@ -561,6 +630,42 @@ async def _amain():
         reply_text, reply_at = BURSTS.setdefault(event.chat_id,
                                                  (incoming, event.date))
 
+        # Собеседник написал ещё раз — прежний ответ уже не к месту
+        autopilot.cancel(event.chat_id)
+
+        async def run_auto(history, full, learned):
+            """Ответить самому: сгенерировать, показать в пульте, отправить."""
+            NAMES[event.chat_id] = sender_name
+            reason = auto_pause_reason(conn, cfg, incoming, event.chat_id)
+            if not reason:
+                try:
+                    reply = await asyncio.to_thread(
+                        responder.reply, history, sender_name, "", learned,
+                        full, cfg.auto.recent_messages)
+                except LLMError:
+                    await client.send_message(
+                        cfg.panel_chat, format_error(sender_name),
+                        parse_mode=None)
+                    return
+                reason = reply.handoff
+
+            if reason:
+                store.pause_auto(conn, event.chat_id, reason)
+                await client.send_message(
+                    cfg.panel_chat, format_handoff(sender_name, reason),
+                    parse_mode=None)
+                return
+
+            autopilot.schedule(event.chat_id, reply.text)
+            card = await client.send_message(
+                cfg.panel_chat,
+                format_auto_card(sender_name, incoming, reply.text,
+                                 cfg.auto.cancel_window_seconds,
+                                 build_chat_link(ctx.sender_username,
+                                                 ctx.sender_id)),
+                parse_mode=None)
+            autopilot.attach_card(event.chat_id, card.id)
+
         async def run_analysis():
             """Дорогая часть: выполняется один раз, когда собеседник замолчал.
 
@@ -577,6 +682,12 @@ async def _amain():
                                  reply_at, cfg.learning.outcome_window_hours)
 
             learned = _learned_style(conn, cfg, event.chat_id)
+            auto_on = (cfg.auto.enabled
+                       and store.is_auto(conn, event.chat_id))
+            if auto_on:
+                await run_auto(history, full, learned)
+                return
+
             try:
                 analysis, variants = await asyncio.to_thread(
                     suggester.analyze, history, sender_name, full, learned)
