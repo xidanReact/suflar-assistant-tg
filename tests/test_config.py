@@ -11,6 +11,12 @@ def _write(tmp_path, body):
     return str(cfg_file)
 
 
+def _write_config(tmp_path, text):
+    path = tmp_path / "config.yaml"
+    path.write_text(text, encoding="utf-8")
+    return load_config(str(path))
+
+
 def test_reads_custom_tones_and_style(tmp_path):
     path = _write(tmp_path, "panel_chat: me\n"
                             "tones: [дерзкий, спокойный]\n"
@@ -134,3 +140,64 @@ def test_learning_ignores_unknown_keys(tmp_path):
     cfg_file.write_text("panel_chat: me\nlearning:\n  min_smaples: 3\n",
                         encoding="utf-8")
     assert load_config(str(cfg_file)).learning.min_samples == 5
+
+
+def test_watch_mode_defaults_to_all(tmp_path):
+    # Конфиг, написанный до списка наблюдения, не должен внезапно замолчать
+    cfg = load_config(_write(tmp_path, "panel_chat: me\n"))
+    assert cfg.watch_mode == "all"
+    assert cfg.debounce_seconds == 0.0
+
+
+def test_reads_watch_mode_and_debounce(tmp_path):
+    cfg = load_config(_write(tmp_path, "panel_chat: me\n"
+                                       "watch_mode: selected\n"
+                                       "debounce_seconds: 8\n"))
+    assert cfg.watch_mode == "selected"
+    assert cfg.debounce_seconds == 8.0
+
+
+def test_unknown_watch_mode_raises(tmp_path):
+    # Опечатка здесь — это молча замолчавший бот, неотличимый от поломки
+    path = _write(tmp_path, "panel_chat: me\nwatch_mode: selectd\n")
+    with pytest.raises(ValueError, match="selectd"):
+        load_config(path)
+
+
+def test_auto_section_is_read(tmp_path):
+    cfg = _write_config(tmp_path, """
+panel_chat: me
+auto:
+  enabled: false
+  cancel_window_seconds: 30
+  max_in_row: 3
+  typing_simulation: false
+  memory_refresh_every: 5
+  recent_messages: 20
+""")
+    assert cfg.auto.enabled is False
+    assert cfg.auto.cancel_window_seconds == 30
+    assert cfg.auto.max_in_row == 3
+    assert cfg.auto.typing_simulation is False
+    assert cfg.auto.memory_refresh_every == 5
+    assert cfg.auto.recent_messages == 20
+
+
+def test_config_without_auto_section_gets_defaults(tmp_path):
+    # Конфиг, написанный до этой фичи, обязан работать как раньше
+    cfg = _write_config(tmp_path, "panel_chat: me\n")
+    assert cfg.auto.enabled is True
+    assert cfg.auto.cancel_window_seconds == 60
+    assert cfg.auto.max_in_row == 10
+    assert cfg.auto.recent_messages == 40
+
+
+def test_unknown_auto_keys_are_ignored(tmp_path):
+    # Как в learning: опечатка в ключе не должна ронять бота на старте
+    cfg = _write_config(tmp_path, """
+panel_chat: me
+auto:
+  max_in_row: 7
+  какая_то_опечатка: 1
+""")
+    assert cfg.auto.max_in_row == 7

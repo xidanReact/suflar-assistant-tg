@@ -4,11 +4,12 @@ from types import SimpleNamespace
 from suflor.main import (
     resolve_incoming_text,
     _ask_password, _collect_history, record_outgoing, resolve_outcomes,
-    harvest_chat, _is_harvestable,
+    harvest_chat, _is_harvestable, auto_pause_reason, is_bot_echo,
+    SENT_BY_BOT, parse_auto_arg,
 )
 from suflor.store import (
     open_store, save_suggestion, style_samples, tone_stats,
-    save_transcript, transcripts,
+    save_transcript, transcripts, save_sent,
 )
 
 
@@ -375,3 +376,60 @@ async def test_resolve_works_without_a_store():
     got = await resolve_incoming_text(None, _FakeTranscriber("слышно"), 1,
                                       "peer", msg)
     assert got == "[голосовое 12 сек] слышно"
+
+
+def test_auto_pause_reason_fires_on_real_world_arrangements(tmp_path):
+    conn = open_store(str(tmp_path / "s.db"))
+    cfg = SimpleNamespace(auto=SimpleNamespace(max_in_row=10))
+    assert auto_pause_reason(conn, cfg, "давай встретимся в субботу", 1)
+
+
+def test_auto_pause_reason_silent_on_ordinary_talk(tmp_path):
+    conn = open_store(str(tmp_path / "s.db"))
+    cfg = SimpleNamespace(auto=SimpleNamespace(max_in_row=10))
+    assert auto_pause_reason(conn, cfg, "как прошёл день?", 1) is None
+
+
+def test_auto_pause_reason_fires_on_too_many_auto_in_row(tmp_path):
+    # Защита от бесконечной беседы модели с человеком
+    conn = open_store(str(tmp_path / "s.db"))
+    cfg = SimpleNamespace(auto=SimpleNamespace(max_in_row=3))
+    for i in range(3):
+        save_sent(conn, 1, f"бот {i}", "auto",
+                  sent_at=datetime(2026, 8, 25, 12, i, tzinfo=timezone.utc))
+    reason = auto_pause_reason(conn, cfg, "как дела?", 1)
+    assert reason is not None and "подряд" in reason
+
+
+def test_bot_echo_is_recognised_once():
+    # Автоответ вернётся в обработчик как моё исходящее — записать его в
+    # корпус манеры значит учить модель на её же текстах
+    SENT_BY_BOT.clear()
+    SENT_BY_BOT.add((1, 100))
+    assert is_bot_echo(1, 100) is True
+    assert is_bot_echo(1, 100) is False   # запись разовая, память не течёт
+
+
+def test_bot_echo_is_false_for_my_own_message():
+    SENT_BY_BOT.clear()
+    assert is_bot_echo(1, 100) is False
+
+
+def test_parse_auto_arg_reads_plain_target():
+    assert parse_auto_arg("@anya") == (True, "@anya")
+
+
+def test_parse_auto_arg_reads_the_off_form():
+    assert parse_auto_arg("off @anya") == (False, "@anya")
+
+
+def test_parse_auto_arg_accepts_russian_off():
+    assert parse_auto_arg("выкл @anya") == (False, "@anya")
+
+
+def test_parse_auto_arg_of_empty_string():
+    assert parse_auto_arg("") == (True, "")
+
+
+def test_parse_auto_arg_does_not_eat_a_username_starting_with_off():
+    assert parse_auto_arg("@offline_girl") == (True, "@offline_girl")

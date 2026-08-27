@@ -3,6 +3,12 @@ from pathlib import Path
 import yaml
 
 DEFAULT_MODEL = "deepseek-v4-pro"
+
+# Реагировать на всех подряд или только на отмеченные /watch диалоги.
+# По умолчанию all: конфиг, написанный до списка наблюдения, не должен
+# внезапно замолчать.
+WATCH_MODES = ("all", "selected")
+DEFAULT_WATCH_MODE = "all"
 DEFAULT_TONES = [
     "игривый, с лёгким флиртом",
     "тёплый, искренний",
@@ -34,6 +40,25 @@ class Learning:
 
 
 @dataclass
+class Auto:
+    """Авторежим: бот сам пишет и отправляет ответ в отмеченных диалогах.
+
+    Список диалогов живёт в базе (команда /auto), здесь только правила игры.
+    Правки применяются при перезапуске.
+    """
+    enabled: bool = True
+    # Сколько ответ висит в пульте, прежде чем уйти собеседнику
+    cancel_window_seconds: float = 60.0
+    # Автоответов подряд без единого моего сообщения — дальше пауза
+    max_in_row: int = 10
+    typing_simulation: bool = True
+    # Обновлять сводку диалога раз в столько новых сообщений
+    memory_refresh_every: int = 10
+    # Сколько последних реплик кладём в промпт ответа
+    recent_messages: int = 40
+
+
+@dataclass
 class Config:
     panel_chat: str
     context_messages: int = 50
@@ -44,9 +69,14 @@ class Config:
     ignore_usernames: list[str] = field(default_factory=list)
     ignore_user_ids: list[int] = field(default_factory=list)
     learning: Learning = field(default_factory=Learning)
+    watch_mode: str = DEFAULT_WATCH_MODE
+    # Сколько ждать тишины, прежде чем разбирать диалог. Серия реплик подряд
+    # превращается в один запрос вместо пяти. 0 — отвечать сразу.
+    debounce_seconds: float = 0.0
     # Факты обо мне — текст файла about_file, уже прочитанный. Пустая строка,
     # пока профиля нет: промпт тогда обязан остаться прежним.
     about: str = ""
+    auto: Auto = field(default_factory=Auto)
 
 
 def _load_about(path: str, name: str | None) -> str:
@@ -65,10 +95,27 @@ def _load_about(path: str, name: str | None) -> str:
     return file.read_text(encoding="utf-8").strip()
 
 
+def _watch_mode(value: str | None) -> str:
+    """Опечатка в режиме — это молчащий бот, поэтому падаем сразу и внятно."""
+    if not value:
+        return DEFAULT_WATCH_MODE
+    if value not in WATCH_MODES:
+        raise ValueError(
+            f"watch_mode: ожидалось одно из {', '.join(WATCH_MODES)}, "
+            f"а не «{value}»")
+    return value
+
+
 def _load_learning(data: dict) -> Learning:
     """Секции learning может не быть вовсе — старый конфиг должен работать."""
     known = {f.name for f in fields(Learning)}
     return Learning(**{k: v for k, v in (data or {}).items() if k in known})
+
+
+def _load_auto(data: dict) -> Auto:
+    """Секции auto может не быть вовсе — старый конфиг должен работать."""
+    known = {f.name for f in fields(Auto)}
+    return Auto(**{k: v for k, v in (data or {}).items() if k in known})
 
 
 def load_config(path: str) -> Config:
@@ -87,4 +134,7 @@ def load_config(path: str) -> Config:
         ignore_usernames=data.get("ignore_usernames", []),
         ignore_user_ids=data.get("ignore_user_ids", []),
         about=_load_about(path, data.get("about_file")),
+        watch_mode=_watch_mode(data.get("watch_mode")),
+        debounce_seconds=float(data.get("debounce_seconds", 0)),
+        auto=_load_auto(data.get("auto")),
     )

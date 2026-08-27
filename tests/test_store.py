@@ -1,10 +1,14 @@
 from datetime import datetime, timedelta, timezone
 
+import pytest
+
 from suflor.store import (
     open_store, save_suggestion, last_suggestion, save_sent, sent_exists,
     save_outcome, pending_outcomes, expire_pending, style_samples, tone_stats,
     suggestion_count, edited_pairs, forget_chat, learning_summary,
-    save_transcript, transcripts,
+    save_transcript, transcripts, watch, unwatch, watched_chats,
+    is_watched, auto_on, auto_off, auto_chats, is_auto, pause_auto,
+    resume_auto, auto_state, auto_in_row, save_memory, memory,
 )
 
 NOW = datetime(2026, 8, 24, 12, tzinfo=timezone.utc)
@@ -264,3 +268,187 @@ def test_forget_chat_wipes_transcripts_too(tmp_path):
     forget_chat(conn, 1)
     assert transcripts(conn, 1) == {}
     assert transcripts(conn, 2) == {10: "чужой"}
+
+
+def test_watching_a_chat_makes_it_watched(tmp_path):
+    conn = _store(tmp_path)
+    watch(conn, 1, "anna", NOW)
+    assert is_watched(conn, 1) is True
+    assert is_watched(conn, 2) is False
+
+
+def test_watched_chats_are_listed_in_the_order_they_were_added(tmp_path):
+    conn = _store(tmp_path)
+    watch(conn, 1, "anna", NOW)
+    watch(conn, 2, "kate", NOW + timedelta(minutes=1))
+    assert [(r["chat_id"], r["username"]) for r in watched_chats(conn)] == [
+        (1, "anna"), (2, "kate")]
+
+
+def test_watching_twice_does_not_duplicate(tmp_path):
+    conn = _store(tmp_path)
+    watch(conn, 1, "anna", NOW)
+    watch(conn, 1, "anna_new", NOW)
+    assert [r["username"] for r in watched_chats(conn)] == ["anna_new"]
+
+
+def test_unwatch_removes_only_that_chat(tmp_path):
+    conn = _store(tmp_path)
+    watch(conn, 1, "anna", NOW)
+    watch(conn, 2, "kate", NOW)
+    assert unwatch(conn, 1) is True
+    assert [r["chat_id"] for r in watched_chats(conn)] == [2]
+
+
+def test_unwatch_reports_when_there_was_nothing_to_remove(tmp_path):
+    assert unwatch(_store(tmp_path), 1) is False
+
+
+def test_watching_a_chat_without_a_username(tmp_path):
+    conn = _store(tmp_path)
+    watch(conn, 1, None, NOW)
+    assert is_watched(conn, 1) is True
+    assert watched_chats(conn)[0]["username"] is None
+
+
+def test_forget_chat_stops_watching(tmp_path):
+    # Стереть про человека всё, но продолжать за ним следить — странно
+    conn = _store(tmp_path)
+    watch(conn, 1, "anna", NOW)
+    forget_chat(conn, 1)
+    assert is_watched(conn, 1) is False
+
+def test_auto_on_puts_the_chat_on_autopilot(tmp_path):
+    conn = _store(tmp_path)
+    assert is_auto(conn, 1) is False
+    auto_on(conn, 1, "anya", NOW)
+    assert is_auto(conn, 1) is True
+
+
+def test_auto_on_twice_refreshes_username_without_duplicating(tmp_path):
+    conn = _store(tmp_path)
+    auto_on(conn, 1, "anya", NOW)
+    auto_on(conn, 1, "anna", NOW)
+    rows = auto_chats(conn)
+    assert len(rows) == 1
+    assert rows[0]["username"] == "anna"
+
+
+def test_auto_off_reports_whether_it_was_on(tmp_path):
+    conn = _store(tmp_path)
+    auto_on(conn, 1, None, NOW)
+    assert auto_off(conn, 1) is True
+    assert auto_off(conn, 1) is False   # второй раз — уже нечего снимать
+    assert is_auto(conn, 1) is False
+
+
+def test_paused_chat_is_not_auto_but_stays_in_the_list(tmp_path):
+    # Пауза — не выключение: диалог виден в /auto с причиной
+    conn = _store(tmp_path)
+    auto_on(conn, 1, None, NOW)
+    pause_auto(conn, 1, "договариваются о встрече")
+    assert is_auto(conn, 1) is False
+    assert auto_state(conn, 1)["paused_reason"] == \
+           "договариваются о встрече"
+    assert len(auto_chats(conn)) == 1
+
+
+def test_resume_auto_clears_the_pause(tmp_path):
+    conn = _store(tmp_path)
+    auto_on(conn, 1, None, NOW)
+    pause_auto(conn, 1, "причина")
+    assert resume_auto(conn, 1) is True
+    assert is_auto(conn, 1) is True
+    assert resume_auto(conn, 1) is False   # паузы не было — сообщать не о чем
+
+
+def test_auto_on_lifts_an_existing_pause(tmp_path):
+    conn = _store(tmp_path)
+    auto_on(conn, 1, None, NOW)
+    pause_auto(conn, 1, "причина")
+    auto_on(conn, 1, None, NOW)
+    assert is_auto(conn, 1) is True
+
+
+def test_auto_state_is_none_for_unknown_chat(tmp_path):
+    assert auto_state(_store(tmp_path), 42) is None
+
+
+def test_auto_in_row_counts_the_tail_of_auto_messages(tmp_path):
+    conn = _store(tmp_path)
+    save_sent(conn, 1, "своё", "own", sent_at=NOW)
+    for i in range(3):
+        save_sent(conn, 1, f"бот {i}", "auto",
+                  sent_at=NOW + timedelta(minutes=i + 1))
+    assert auto_in_row(conn, 1) == 3
+
+
+def test_my_own_message_resets_the_row(tmp_path):
+    conn = _store(tmp_path)
+    save_sent(conn, 1, "бот", "auto", sent_at=NOW)
+    save_sent(conn, 1, "своё", "own", sent_at=NOW + timedelta(minutes=1))
+    assert auto_in_row(conn, 1) == 0
+
+
+def test_auto_in_row_is_per_chat(tmp_path):
+    conn = _store(tmp_path)
+    save_sent(conn, 1, "бот", "auto", sent_at=NOW)
+    assert auto_in_row(conn, 2) == 0
+
+
+def test_auto_messages_never_become_style_samples(tmp_path):
+    # Иначе профиль манеры начнёт учиться на текстах самой модели
+    conn = _store(tmp_path)
+    save_sent(conn, 1, "текст модели", "auto", sent_at=NOW)
+    assert style_samples(conn) == []
+
+
+def test_forget_chat_removes_it_from_autopilot(tmp_path):
+    conn = _store(tmp_path)
+    auto_on(conn, 1, "anya", NOW)
+    forget_chat(conn, 1)
+    assert auto_chats(conn) == []
+
+
+def test_learning_summary_counts_auto_messages(tmp_path):
+    conn = _store(tmp_path)
+    sent_id = save_sent(conn, 1, "бот", "auto", sent_at=NOW)
+    save_outcome(conn, sent_id, NOW + timedelta(minutes=5), "ага", 300, 0.8)
+    summary = learning_summary(conn)
+    assert summary["auto"] == 1
+    assert summary["auto_score"] == pytest.approx(0.8)
+
+
+def test_memory_is_none_until_saved(tmp_path):
+    assert memory(_store(tmp_path), 1) is None
+
+
+def test_save_memory_round_trip(tmp_path):
+    conn = _store(tmp_path)
+    save_memory(conn, 1, "Аня, 24, из Томска", 30, NOW)
+    stored = memory(conn, 1)
+    assert stored["summary"] == "Аня, 24, из Томска"
+    assert stored["msg_count"] == 30
+    assert stored["updated_at"] == NOW
+
+
+def test_save_memory_overwrites_the_previous_summary(tmp_path):
+    # Сводка одна на диалог: она переписывается, а не копится версиями
+    conn = _store(tmp_path)
+    save_memory(conn, 1, "старая", 10, NOW)
+    save_memory(conn, 1, "новая", 20, NOW)
+    assert memory(conn, 1)["summary"] == "новая"
+    assert memory(conn, 1)["msg_count"] == 20
+
+
+def test_memory_is_per_chat(tmp_path):
+    conn = _store(tmp_path)
+    save_memory(conn, 1, "про Аню", 10, NOW)
+    assert memory(conn, 2) is None
+
+
+def test_forget_chat_erases_the_summary(tmp_path):
+    conn = _store(tmp_path)
+    save_memory(conn, 1, "про Аню", 10, NOW)
+    forget_chat(conn, 1)
+    assert memory(conn, 1) is None
