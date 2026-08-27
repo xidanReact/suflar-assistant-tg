@@ -104,9 +104,13 @@ def build_system_prompt(tones: list[str], style: str,
 def build_messages(history: list[dict], system_prompt: str,
                    now: datetime | None = None,
                    partner_name: str | None = None,
-                   full_history: bool = True) -> list[dict]:
+                   full_history: bool = True,
+                   summary: str = "") -> list[dict]:
     """Диалог для модели: реплики, заметные паузы между ними, время,
     прошедшее с последнего сообщения, и сводка по инициативе.
+
+    summary — накопленная память о диалоге. Пустая строка не добавляет в
+    запрос ничего: суфлёр без памяти работает ровно как раньше.
     """
     partner = partner_name or "Собеседник"
     dialog_text = format_history(history, partner)
@@ -116,7 +120,9 @@ def build_messages(history: list[dict], system_prompt: str,
         f"\n\n{block}" for block in
         (initiative_summary(history, partner, full_history),
          questions_asked(history, partner)) if block)
-    user = (f"Вот переписка:\n{dialog_text}{since}{blocks}"
+    memory_block = (f"Что я помню об этом разговоре:\n{summary}\n\n"
+                    if summary else "")
+    user = (f"{memory_block}Вот переписка:\n{dialog_text}{since}{blocks}"
             "\n\nДай варианты моего ответа.")
     return [
         {"role": "system", "content": system_prompt},
@@ -169,30 +175,31 @@ class Suggester:
 
     def _complete(self, system_prompt: str, history: list[dict],
                   max_tokens: int, partner_name: str | None = None,
-                  full_history: bool = True) -> str:
+                  full_history: bool = True, summary: str = "") -> str:
         return complete(
             self._client, self._model,
             build_messages(history, system_prompt, partner_name=partner_name,
-                           full_history=full_history),
+                           full_history=full_history, summary=summary),
             self._temperature, max_tokens)
 
     def analyze(self, history: list[dict],
                 partner_name: str | None = None,
                 full_history: bool = True,
-                style_block: str = "") -> tuple[str, list[str]]:
+                style_block: str = "",
+                summary: str = "") -> tuple[str, list[str]]:
         """Разбор диалога плюс варианты следующего сообщения.
 
         full_history=False — переписка обрезана лимитом контекста, начало не
         видно: тогда о том, кто написал первым, судить нельзя.
         style_block — выученная манера письма, пустая строка до накопления
-        данных.
+        данных. summary — память о диалоге, так же необязательна.
         """
         prompt = self._system_prompt
         if style_block:
             prompt = build_system_prompt(self._tones, self._style,
                                          style_block, self._about)
         raw = self._complete(prompt, history, self._max_tokens,
-                             partner_name, full_history)
+                             partner_name, full_history, summary)
         variants = parse_suggestions(raw)
         if not variants:
             raise SuggesterError("модель вернула пустой/неразборчивый ответ")

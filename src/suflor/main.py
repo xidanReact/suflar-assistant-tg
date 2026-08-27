@@ -17,6 +17,7 @@ from suflor.outcome import reply_stats, score_reply, has_question
 from suflor import store, profile, media, handoff, llm
 from suflor.autopilot import Autopilot
 from suflor.responder import Responder
+from suflor.memory import Summarizer, refresh as refresh_memory
 from suflor.llm import LLMError
 from suflor.debounce import Debouncer
 from suflor.control_panel import (
@@ -285,6 +286,16 @@ def _learned_style(conn, cfg, chat_id: int) -> str:
                                min_samples=cfg.learning.min_samples)
 
 
+async def _dialog_memory(conn, cfg, summarizer, chat_id: int,
+                         history: list[dict], partner_name: str) -> str:
+    """Сводка диалога. Пустая строка — работаем без памяти, это допустимо."""
+    if conn is None:
+        return ""
+    return await asyncio.to_thread(
+        refresh_memory, conn, summarizer, chat_id, history,
+        cfg.auto.memory_refresh_every, partner_name)
+
+
 async def _handle_forget(client, conn, cfg, arg: str):
     """Стереть из базы всё, что связано с человеком."""
     target = parse_hint_target(arg) if arg else None
@@ -353,7 +364,7 @@ async def _handle_watch(client, conn, cfg, arg: str):
         parse_mode=None)
 
 
-async def _handle_auto(client, conn, cfg, autopilot, arg: str):
+async def _handle_auto(client, conn, cfg, autopilot, summarizer, arg: str):
     """Управление автопилотом, а без аргумента — список диалогов."""
     turn_on, target_arg = parse_auto_arg(arg)
     if not target_arg:
@@ -388,6 +399,11 @@ async def _handle_auto(client, conn, cfg, autopilot, arg: str):
         return
 
     store.auto_on(conn, chat_id, getattr(entity, "username", None))
+    # Первую сводку собираем сразу, чтобы и первый автоответ был с памятью
+    history, _ = await _collect_history(client, entity, cfg.context_messages,
+                                        store.transcripts(conn, chat_id))
+    if history:
+        await _dialog_memory(conn, cfg, summarizer, chat_id, history, name)
     total = len(store.auto_chats(conn))
     note = ("" if cfg.auto.enabled
             else " Но в конфиге auto.enabled: false — режим выключен целиком.")
@@ -518,7 +534,8 @@ async def _handle_train(client, conn, cfg, arg: str):
         f"Собрал {total} моих сообщений из {chats} диалогов.", parse_mode=None)
 
 
-async def _handle_hint(client, cfg, suggester, event, arg: str, conn=None):
+async def _handle_hint(client, cfg, suggester, summarizer, event,
+                       arg: str, conn=None):
     """Разбор уже существующего диалога по запросу из пульта."""
     if arg:
         target = parse_hint_target(arg)
@@ -550,10 +567,12 @@ async def _handle_hint(client, cfg, suggester, event, arg: str, conn=None):
         return
 
     learned = _learned_style(conn, cfg, chat_id)
+    summary = await _dialog_memory(conn, cfg, summarizer, chat_id, history,
+                                   name)
     try:
         analysis, variants = await asyncio.to_thread(suggester.analyze,
                                                      history, name, full,
-                                                     learned)
+                                                     learned, summary)
     except SuggesterError:
         await client.send_message(cfg.panel_chat, format_error(name),
                                   parse_mode=None)
@@ -583,6 +602,7 @@ async def _amain():
     responder = Responder(client=llm_client, style=cfg.style,
                           temperature=cfg.temperature, model=cfg.model,
                           about=cfg.about)
+    summarizer = Summarizer(client=llm_client, model=cfg.model)
 
     conn = store.open_store(DB_PATH)
     # Диалоги, заглохшие ещё до перезапуска, ответа уже не дождутся
@@ -642,7 +662,7 @@ async def _amain():
                 )
                 return
             if cmd == "/hint" or cmd.startswith("/hint "):
-                await _handle_hint(client, cfg, suggester, event,
+                await _handle_hint(client, cfg, suggester, summarizer, event,
                                    cmd[len("/hint"):].strip(), conn)
                 return
             if cmd == "/train" or cmd.startswith("/train "):
@@ -671,7 +691,7 @@ async def _amain():
                                       cmd[len("/unwatch"):].strip())
                 return
             if cmd == "/auto" or cmd.startswith("/auto "):
-                await _handle_auto(client, conn, cfg, autopilot,
+                await _handle_auto(client, conn, cfg, autopilot, summarizer,
                                    cmd[len("/auto"):].strip())
                 return
             if cmd == "/stop" or cmd.startswith("/stop "):
@@ -755,10 +775,13 @@ async def _amain():
             NAMES[event.chat_id] = sender_name
             reason = auto_pause_reason(conn, cfg, incoming, event.chat_id)
             if not reason:
+                summary = await _dialog_memory(conn, cfg, summarizer,
+                                               event.chat_id, history,
+                                               sender_name)
                 try:
                     reply = await asyncio.to_thread(
-                        responder.reply, history, sender_name, "", learned,
-                        full, cfg.auto.recent_messages)
+                        responder.reply, history, sender_name, summary,
+                        learned, full, cfg.auto.recent_messages)
                 except LLMError:
                     await client.send_message(
                         cfg.panel_chat, format_error(sender_name),
@@ -805,9 +828,13 @@ async def _amain():
                 await run_auto(history, full, learned)
                 return
 
+            summary = await _dialog_memory(conn, cfg, summarizer,
+                                           event.chat_id, history,
+                                           sender_name)
             try:
                 analysis, variants = await asyncio.to_thread(
-                    suggester.analyze, history, sender_name, full, learned)
+                    suggester.analyze, history, sender_name, full, learned,
+                    summary)
             except SuggesterError:
                 await client.send_message(
                     cfg.panel_chat, format_error(sender_name), parse_mode=None)

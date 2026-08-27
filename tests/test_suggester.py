@@ -325,3 +325,15 @@ def test_prompt_forbids_guessing_what_an_untranscribed_voice_said():
     prompt = build_system_prompt(["дерзкий"], "стиль")
     assert "не расшифровано" in prompt
     assert "не делай вид, что знаешь" in prompt
+
+
+def test_build_messages_includes_the_summary():
+    user = build_messages([{"from_me": False, "text": "привет"}], "промпт",
+                          summary="Аня, 24, из Томска")[1]["content"]
+    assert "Аня, 24, из Томска" in user
+
+
+def test_build_messages_without_summary_is_unchanged():
+    # Суфлёр без памяти обязан давать ровно тот же запрос, что и раньше
+    history = [{"from_me": False, "text": "привет"}]
+    assert build_messages(history, "промпт") ==         build_messages(history, "промпт", summary="")
